@@ -354,6 +354,12 @@ def process_profile_collection(user_id, message, relationship, prefecture, munic
 
     engine = get_db_engine()
 
+    # ヘルプと設定は常に表示可能
+    if message == 'ヘルプ':
+        return get_help_message()
+    elif message == '設定':
+        return get_settings_message(user_id, relationship, prefecture, municipality, death_date)
+
     # プロフィールが全て揃っている場合
     if relationship and prefecture and municipality and death_date:
         # 既にタスクが生成されているかチェック
@@ -371,6 +377,10 @@ def process_profile_collection(user_id, message, relationship, prefecture, munic
                     return get_task_list_message(user_id)
                 elif message == '全タスク':
                     return get_task_list_message(user_id, show_all=True)
+                elif message == 'ヘルプ':
+                    return get_help_message()
+                elif message == '設定':
+                    return get_settings_message(user_id, relationship, prefecture, municipality, death_date)
                 elif '完了' in message and any(c.isdigit() or c in '０１２３４５６７８９' for c in message):
                     # 「完了1」「1完了」「完了１」「１完了」などのパターンをチェック
                     return complete_task(user_id, message)
@@ -1028,3 +1038,50 @@ def handle_postback(event: PostbackEvent):
                     messages=[TextMessage(text=f"不明なアクション: {action}")]
                 )
             )
+
+
+def get_help_message() -> str:
+    """ヘルプメッセージを生成"""
+    return """【受け継ぐAI 使い方ガイド】
+
+🤖 **受け継ぐAIとは**
+大切な方が亡くなられた後の行政手続きをサポートするLINE Botです。
+
+📋 **主な機能**
+1. タスク管理
+   - 必要な手続きを自動でリストアップ
+   - 期限・優先度を表示
+   - 完了したタスクにチェック
+
+2. AI相談
+   - 手続きに関する質問に回答
+   - 行政ナレッジベースを活用
+
+3. リッチメニュー
+   - タスク一覧：やるべきことを確認
+   - AI相談：質問や相談
+   - 設定：プロフィール確認
+   - ヘルプ：このメッセージ
+
+📞 **お問い合わせ**
+k.shimada1115@gmail.com
+
+💡 **ヒント**
+- 「タスク」でタスク一覧を表示
+- 「全タスク」で完了済み含む全て表示
+- 質問は自由に入力してください"""
+
+
+def get_settings_message(user_id: str, relationship: str, prefecture: str, municipality: str, death_date) -> str:
+    """設定メッセージを生成"""
+    # 死亡日をフォーマット
+    death_date_str = death_date.strftime("%Y年%m月%d日") if death_date else "未設定"
+
+    return f"""【現在の設定】
+
+👤 **故人との関係**: {relationship or '未設定'}
+📍 **お住まい**: {prefecture or '未設定'} {municipality or ''}
+📅 **死亡日**: {death_date_str}
+
+💡 プロフィール情報を変更したい場合は、お手数ですが管理者までお問い合わせください。
+📧 k.shimada1115@gmail.com"""
