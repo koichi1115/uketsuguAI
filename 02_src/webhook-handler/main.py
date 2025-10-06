@@ -27,6 +27,7 @@ from google.cloud.sql.connector import Connector
 import sqlalchemy
 from datetime import datetime, timezone
 import google.generativeai as genai
+from flex_messages import create_task_list_flex, create_task_completed_flex
 
 # 環境変数からGCP設定を取得
 PROJECT_ID = os.environ.get('GCP_PROJECT_ID')
@@ -297,18 +298,30 @@ def handle_message(event: MessageEvent):
         conn.commit()
 
     # プロフィール収集フロー
-    reply_text = process_profile_collection(
+    reply_message = process_profile_collection(
         user_id, user_message, relationship, prefecture, municipality, death_date
     )
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text)]
+
+        # Flex Messageかテキストメッセージか判定
+        if isinstance(reply_message, dict):
+            # Flex Message
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[FlexMessage(alt_text="タスク一覧", contents=FlexContainer.from_dict(reply_message))]
+                )
             )
-        )
+        else:
+            # テキストメッセージ
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_message)]
+                )
+            )
 
 
 def process_profile_collection(user_id, message, relationship, prefecture, municipality, death_date):
@@ -329,8 +342,16 @@ def process_profile_collection(user_id, message, relationship, prefecture, munic
             ).scalar()
 
             if task_count > 0:
-                # タスク生成済み - AI会話モード
-                return generate_ai_response(user_id, message)
+                # タスク生成済み - タスク一覧表示 or タスク完了 or AI会話モード
+                if message in ['タスク', 'タスク一覧', 'タスクリスト', 'todo', 'TODO']:
+                    return get_task_list_message(user_id)
+                elif message == '全タスク':
+                    return get_task_list_message(user_id, show_all=True)
+                elif '完了' in message and any(c.isdigit() or c in '０１２３４５６７８９' for c in message):
+                    # 「完了1」「1完了」「完了１」「１完了」などのパターンをチェック
+                    return complete_task(user_id, message)
+                else:
+                    return generate_ai_response(user_id, message)
             else:
                 # タスク生成
                 with engine.connect() as conn:
@@ -440,6 +461,116 @@ def process_profile_collection(user_id, message, relationship, prefecture, munic
                 return "日付の形式が正しくありません。\nYYYY-MM-DD形式で入力してください。\n（例：2024-01-15）"
 
 
+def get_task_list_message(user_id: str, show_all: bool = False):
+    """タスク一覧をFlex Messageで返す"""
+    engine = get_db_engine()
+
+    with engine.connect() as conn:
+        tasks = conn.execute(
+            sqlalchemy.text(
+                """
+                SELECT id, title, due_date, status, priority, category
+                FROM tasks
+                WHERE user_id = :user_id AND is_deleted = false
+                ORDER BY
+                    CASE status
+                        WHEN 'pending' THEN 1
+                        WHEN 'in_progress' THEN 2
+                        ELSE 3
+                    END,
+                    due_date ASC
+                """
+            ),
+            {"user_id": user_id}
+        ).fetchall()
+
+    # Flex Messageを返す
+    return create_task_list_flex(tasks, show_all=show_all)
+
+
+def complete_task(user_id: str, message: str) -> str:
+    """タスクを完了にする"""
+    engine = get_db_engine()
+
+    # タスク番号を抽出（様々なパターンに対応）
+    import re
+
+    # 全角数字を半角に変換
+    def normalize_number(text):
+        zen_to_han = str.maketrans('０１２３４５６７８９', '0123456789')
+        return text.translate(zen_to_han)
+
+    normalized_msg = normalize_number(message)
+
+    # 「完了1」「完了 1」「1完了」「1 完了」などのパターンに対応
+    patterns = [
+        r'完了[\s　]*(\d+)',  # 完了1, 完了 1, 完了　1
+        r'(\d+)[\s　]*完了',  # 1完了, 1 完了, 1　完了
+    ]
+
+    task_num = None
+    for pattern in patterns:
+        match = re.search(pattern, normalized_msg)
+        if match:
+            task_num = int(match.group(1))
+            break
+
+    if task_num is None:
+        return "タスク番号が正しくありません。\n「完了1」または「1完了」のように番号を指定してください。"
+
+    # 未完了タスクを取得（番号順）
+    with engine.connect() as conn:
+        pending_tasks = conn.execute(
+            sqlalchemy.text(
+                """
+                SELECT id, title
+                FROM tasks
+                WHERE user_id = :user_id AND is_deleted = false AND status = 'pending'
+                ORDER BY due_date ASC
+                """
+            ),
+            {"user_id": user_id}
+        ).fetchall()
+
+        if not pending_tasks:
+            return "完了可能なタスクがありません。"
+
+        if task_num < 1 or task_num > len(pending_tasks):
+            return f"タスク番号は1〜{len(pending_tasks)}の範囲で指定してください。"
+
+        # 指定されたタスクを完了にする
+        task_id, task_title = pending_tasks[task_num - 1]
+
+        conn.execute(
+            sqlalchemy.text(
+                """
+                UPDATE tasks
+                SET status = 'completed'
+                WHERE id = :task_id
+                """
+            ),
+            {"task_id": task_id}
+        )
+
+        # task_progressに記録
+        conn.execute(
+            sqlalchemy.text(
+                """
+                INSERT INTO task_progress (task_id, status, completed_at)
+                VALUES (:task_id, 'completed', :completed_at)
+                """
+            ),
+            {
+                "task_id": task_id,
+                "completed_at": datetime.now(timezone.utc)
+            }
+        )
+
+        conn.commit()
+
+    return f"✅ 「{task_title}」を完了しました！\n\n他のタスクを確認するには「タスク」と送信してください。"
+
+
 def generate_ai_response(user_id: str, user_message: str) -> str:
     """Gemini APIを使ってAI応答を生成"""
     engine = get_db_engine()
@@ -495,6 +626,7 @@ def generate_ai_response(user_id: str, user_message: str) -> str:
 - 簡潔で分かりやすく（200文字以内）
 - 優しく丁寧な言葉遣い
 - 必要に応じて次のステップを提案する
+- 「心よりお悔やみ申し上げます」などの前置きは不要
 """
 
     # 会話履歴を逆順にして（古い順に）プロンプトに追加
@@ -550,18 +682,181 @@ def handle_postback(event: PostbackEvent):
     line_user_id = event.source.user_id
     postback_data = event.postback.data
     configuration = get_configuration()
+    engine = get_db_engine()
 
     # ポストバックデータをパース
     params = dict(param.split('=') for param in postback_data.split('&'))
     action = params.get('action', '')
 
-    reply_text = f"ポストバックを受け取りました: {action}"
+    if action == 'complete_task':
+        task_id = params.get('task_id', '')
 
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text)]
+        # ユーザーIDを取得
+        with engine.connect() as conn:
+            user_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT u.id
+                    FROM users u
+                    WHERE u.line_user_id = :line_user_id
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            ).fetchone()
+
+            if not user_data:
+                reply_message = "ユーザー情報が見つかりません。"
+            else:
+                user_id = user_data[0]
+
+                # タスク情報を取得
+                task_data = conn.execute(
+                    sqlalchemy.text(
+                        """
+                        SELECT title
+                        FROM tasks
+                        WHERE id = :task_id AND user_id = :user_id
+                        """
+                    ),
+                    {"task_id": task_id, "user_id": user_id}
+                ).fetchone()
+
+                if not task_data:
+                    reply_message = "タスクが見つかりません。"
+                else:
+                    task_title = task_data[0]
+
+                    # タスクを完了にする
+                    conn.execute(
+                        sqlalchemy.text(
+                            """
+                            UPDATE tasks
+                            SET status = 'completed'
+                            WHERE id = :task_id
+                            """
+                        ),
+                        {"task_id": task_id}
+                    )
+
+                    # task_progressに記録
+                    conn.execute(
+                        sqlalchemy.text(
+                            """
+                            INSERT INTO task_progress (task_id, status, completed_at)
+                            VALUES (:task_id, 'completed', :completed_at)
+                            """
+                        ),
+                        {
+                            "task_id": task_id,
+                            "completed_at": datetime.now(timezone.utc)
+                        }
+                    )
+
+                    conn.commit()
+
+                    # 完了メッセージのFlex Messageを生成
+                    reply_message = create_task_completed_flex(task_title)
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+
+            # Flex Messageかテキストメッセージか判定
+            if isinstance(reply_message, dict):
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[FlexMessage(alt_text="タスク完了", contents=FlexContainer.from_dict(reply_message))]
+                    )
+                )
+            else:
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_message)]
+                    )
+                )
+
+    elif action == 'uncomplete_task':
+        task_id = params.get('task_id', '')
+
+        # ユーザーIDを取得
+        with engine.connect() as conn:
+            user_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT u.id
+                    FROM users u
+                    WHERE u.line_user_id = :line_user_id
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            ).fetchone()
+
+            if not user_data:
+                reply_message = "ユーザー情報が見つかりません。"
+            else:
+                user_id = user_data[0]
+
+                # タスク情報を取得
+                task_data = conn.execute(
+                    sqlalchemy.text(
+                        """
+                        SELECT title
+                        FROM tasks
+                        WHERE id = :task_id AND user_id = :user_id
+                        """
+                    ),
+                    {"task_id": task_id, "user_id": user_id}
+                ).fetchone()
+
+                if not task_data:
+                    reply_message = "タスクが見つかりません。"
+                else:
+                    task_title = task_data[0]
+
+                    # タスクを未完了に戻す
+                    conn.execute(
+                        sqlalchemy.text(
+                            """
+                            UPDATE tasks
+                            SET status = 'pending'
+                            WHERE id = :task_id
+                            """
+                        ),
+                        {"task_id": task_id}
+                    )
+
+                    # task_progressに記録
+                    conn.execute(
+                        sqlalchemy.text(
+                            """
+                            INSERT INTO task_progress (task_id, status, completed_at)
+                            VALUES (:task_id, 'pending', NULL)
+                            """
+                        ),
+                        {"task_id": task_id}
+                    )
+
+                    conn.commit()
+
+                    reply_message = f"「{task_title}」を未完了に戻しました。\n\nタスク一覧を確認するには「タスク」と送信してください。"
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_message)]
+                )
             )
-        )
+
+    else:
+        # 未知のアクション
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=f"不明なアクション: {action}")]
+                )
+            )
