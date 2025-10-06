@@ -482,8 +482,7 @@ def process_profile_collection(user_id, message, relationship, prefecture, munic
             conn.commit()
 
             # 死亡日選択用のDatetimepicker Quick Reply
-            import datetime
-            today = datetime.date.today()
+            today = datetime.now().date()
 
             death_date_quick_reply = QuickReply(
                 items=[
@@ -506,7 +505,6 @@ def process_profile_collection(user_id, message, relationship, prefecture, munic
         elif not death_date:
             # 死亡日を保存
             try:
-                from datetime import datetime
                 death_dt = datetime.fromisoformat(message).date()
 
                 conn.execute(
@@ -831,8 +829,8 @@ def handle_postback(event: PostbackEvent):
 
                     conn.commit()
 
-                    # 完了メッセージのFlex Messageを生成
-                    reply_message = create_task_completed_flex(task_title)
+                    # 更新されたタスク一覧を表示
+                    reply_message = get_task_list_message(user_id)
 
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
@@ -916,16 +914,27 @@ def handle_postback(event: PostbackEvent):
 
                     conn.commit()
 
-                    reply_message = f"「{task_title}」を未完了に戻しました。\n\nタスク一覧を確認するには「タスク」と送信してください。"
+                    # 更新されたタスク一覧を表示
+                    reply_message = get_task_list_message(user_id)
 
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=reply_message)]
+
+            # Flex Messageかテキストメッセージか判定
+            if isinstance(reply_message, dict):
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[FlexMessage(alt_text="タスク一覧", contents=FlexContainer.from_dict(reply_message))]
+                    )
                 )
-            )
+            else:
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_message)]
+                    )
+                )
 
     elif action == 'set_death_date':
         # Datetimepickerから日付を取得
@@ -955,7 +964,6 @@ def handle_postback(event: PostbackEvent):
                 municipality = user_data[2] or "（未設定）"
 
                 # 死亡日を保存
-                from datetime import datetime
                 death_dt = datetime.fromisoformat(selected_date).date()
 
                 conn.execute(
