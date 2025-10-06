@@ -14,7 +14,11 @@ from linebot.v3.messaging import (
     ReplyMessageRequest,
     TextMessage,
     FlexMessage,
-    FlexContainer
+    FlexContainer,
+    QuickReply,
+    QuickReplyItem,
+    MessageAction,
+    DatetimePickerAction
 )
 from linebot.v3.webhooks import (
     MessageEvent,
@@ -220,20 +224,27 @@ def handle_follow(event: FollowEvent):
 受け継ぐAIです。
 大切な方を亡くされた後の手続きをサポートします。
 
-まずは、以下の情報を教えてください：
-1. あなたと故人の関係
-2. お住まいの都道府県・市区町村
-3. 故人が亡くなられた日
+まず、あなたと故人の関係を選択してください。"""
 
-※個人情報の入力にご注意ください
-電話番号、マイナンバー等は入力しないでください"""
+    # Quick Reply（故人との関係）
+    quick_reply = QuickReply(
+        items=[
+            QuickReplyItem(action=MessageAction(label="父", text="父")),
+            QuickReplyItem(action=MessageAction(label="母", text="母")),
+            QuickReplyItem(action=MessageAction(label="配偶者", text="配偶者")),
+            QuickReplyItem(action=MessageAction(label="兄弟姉妹", text="兄弟姉妹")),
+            QuickReplyItem(action=MessageAction(label="祖父母", text="祖父母")),
+            QuickReplyItem(action=MessageAction(label="子", text="子")),
+            QuickReplyItem(action=MessageAction(label="その他", text="その他"))
+        ]
+    )
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         line_bot_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[TextMessage(text=welcome_message)]
+                messages=[TextMessage(text=welcome_message, quick_reply=quick_reply)]
             )
         )
 
@@ -305,15 +316,27 @@ def handle_message(event: MessageEvent):
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
 
-        # Flex Messageかテキストメッセージか判定
+        # 返信メッセージの種類を判定
         if isinstance(reply_message, dict):
-            # Flex Message
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[FlexMessage(alt_text="タスク一覧", contents=FlexContainer.from_dict(reply_message))]
+            if reply_message.get("type") == "text_with_quick_reply":
+                # Quick Reply付きテキストメッセージ
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(
+                            text=reply_message["text"],
+                            quick_reply=reply_message["quick_reply"]
+                        )]
+                    )
                 )
-            )
+            else:
+                # Flex Message
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[FlexMessage(alt_text="タスク一覧", contents=FlexContainer.from_dict(reply_message))]
+                    )
+                )
         else:
             # テキストメッセージ
             line_bot_api.reply_message(
@@ -402,29 +425,83 @@ def process_profile_collection(user_id, message, relationship, prefecture, munic
                     {"user_id": user_id, "relationship": message}
                 )
             conn.commit()
-            return "ありがとうございます。\n\n次に、お住まいの都道府県と市区町村を教えてください。\n（例：東京都 渋谷区）"
 
-        elif not prefecture or not municipality:
-            # 都道府県・市区町村を解析して保存
-            parts = message.replace('　', ' ').split()
-            if len(parts) >= 2:
-                pref = parts[0]
-                muni = parts[1]
+            # 都道府県選択用のQuick Reply
+            prefecture_quick_reply = QuickReply(
+                items=[
+                    QuickReplyItem(action=MessageAction(label="東京都", text="東京都")),
+                    QuickReplyItem(action=MessageAction(label="大阪府", text="大阪府")),
+                    QuickReplyItem(action=MessageAction(label="神奈川県", text="神奈川県")),
+                    QuickReplyItem(action=MessageAction(label="愛知県", text="愛知県")),
+                    QuickReplyItem(action=MessageAction(label="埼玉県", text="埼玉県")),
+                    QuickReplyItem(action=MessageAction(label="千葉県", text="千葉県")),
+                    QuickReplyItem(action=MessageAction(label="兵庫県", text="兵庫県")),
+                    QuickReplyItem(action=MessageAction(label="福岡県", text="福岡県")),
+                    QuickReplyItem(action=MessageAction(label="北海道", text="北海道")),
+                    QuickReplyItem(action=MessageAction(label="京都府", text="京都府")),
+                    QuickReplyItem(action=MessageAction(label="その他", text="その他"))
+                ]
+            )
 
-                conn.execute(
-                    sqlalchemy.text(
-                        """
-                        UPDATE user_profiles
-                        SET prefecture = :prefecture, municipality = :municipality
-                        WHERE user_id = :user_id
-                        """
-                    ),
-                    {"user_id": user_id, "prefecture": pref, "municipality": muni}
-                )
-                conn.commit()
-                return f"ありがとうございます。\n\n最後に、故人が亡くなられた日を教えてください。\n（例：2024-01-15）"
-            else:
-                return "都道府県と市区町村を教えてください。\n（例：東京都 渋谷区）"
+            return {
+                "type": "text_with_quick_reply",
+                "text": "ありがとうございます。\n\n次に、お住まいの都道府県を選択してください。\n（一覧にない場合は直接入力してください）",
+                "quick_reply": prefecture_quick_reply
+            }
+
+        elif not prefecture:
+            # 都道府県を保存
+            if message == "その他":
+                return "都道府県名を入力してください。\n（例：静岡県）"
+
+            conn.execute(
+                sqlalchemy.text(
+                    """
+                    UPDATE user_profiles
+                    SET prefecture = :prefecture
+                    WHERE user_id = :user_id
+                    """
+                ),
+                {"user_id": user_id, "prefecture": message}
+            )
+            conn.commit()
+            return "ありがとうございます。\n\n次に、市区町村を教えてください。\n（例：渋谷区）"
+
+        elif not municipality:
+            # 市区町村を保存
+            conn.execute(
+                sqlalchemy.text(
+                    """
+                    UPDATE user_profiles
+                    SET municipality = :municipality
+                    WHERE user_id = :user_id
+                    """
+                ),
+                {"user_id": user_id, "municipality": message}
+            )
+            conn.commit()
+
+            # 死亡日選択用のDatetimepicker Quick Reply
+            import datetime
+            today = datetime.date.today()
+
+            death_date_quick_reply = QuickReply(
+                items=[
+                    QuickReplyItem(action=DatetimePickerAction(
+                        label="日付を選択",
+                        data="action=set_death_date",
+                        mode="date",
+                        initial=today.isoformat(),
+                        max=today.isoformat()
+                    ))
+                ]
+            )
+
+            return {
+                "type": "text_with_quick_reply",
+                "text": "ありがとうございます。\n\n最後に、故人が亡くなられた日を選択してください。",
+                "quick_reply": death_date_quick_reply
+            }
 
         elif not death_date:
             # 死亡日を保存
@@ -840,6 +917,71 @@ def handle_postback(event: PostbackEvent):
                     conn.commit()
 
                     reply_message = f"「{task_title}」を未完了に戻しました。\n\nタスク一覧を確認するには「タスク」と送信してください。"
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_message)]
+                )
+            )
+
+    elif action == 'set_death_date':
+        # Datetimepickerから日付を取得
+        from task_generator import generate_basic_tasks, get_task_summary_message
+
+        selected_date = event.postback.params.get('date')  # YYYY-MM-DD形式
+
+        # ユーザーIDを取得
+        with engine.connect() as conn:
+            user_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT u.id, up.prefecture, up.municipality
+                    FROM users u
+                    LEFT JOIN user_profiles up ON u.id = up.user_id
+                    WHERE u.line_user_id = :line_user_id
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            ).fetchone()
+
+            if not user_data:
+                reply_message = "ユーザー情報が見つかりません。"
+            else:
+                user_id = user_data[0]
+                prefecture = user_data[1] or "（未設定）"
+                municipality = user_data[2] or "（未設定）"
+
+                # 死亡日を保存
+                from datetime import datetime
+                death_dt = datetime.fromisoformat(selected_date).date()
+
+                conn.execute(
+                    sqlalchemy.text(
+                        """
+                        UPDATE user_profiles
+                        SET death_date = :death_date
+                        WHERE user_id = :user_id
+                        """
+                    ),
+                    {"user_id": user_id, "death_date": death_dt}
+                )
+                conn.commit()
+
+                # タスク生成
+                tasks = generate_basic_tasks(
+                    user_id,
+                    {
+                        'death_date': death_dt,
+                        'prefecture': prefecture,
+                        'municipality': municipality
+                    },
+                    conn
+                )
+
+                reply_message = get_task_summary_message(tasks, municipality)
 
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
