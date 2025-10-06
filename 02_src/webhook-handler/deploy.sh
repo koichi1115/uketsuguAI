@@ -21,7 +21,7 @@ gcloud functions deploy ${FUNCTION_NAME} \
   --allow-unauthenticated \
   --env-vars-file=.env.yaml \
   --service-account=webhook-handler@${PROJECT_ID}.iam.gserviceaccount.com \
-  --memory=256Mi \
+  --memory=512Mi \
   --timeout=60s \
   --max-instances=10
 

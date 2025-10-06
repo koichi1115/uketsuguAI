@@ -13,5 +13,8 @@ pg8000==1.*
 google-cloud-secret-manager==2.*
 cloud-sql-python-connector==1.*
 
+# AI
+google-generativeai>=0.8.0
+
 # Utilities
 python-dotenv==1.*

@@ -26,6 +26,7 @@ from google.cloud import secretmanager
 from google.cloud.sql.connector import Connector
 import sqlalchemy
 from datetime import datetime, timezone
+import google.generativeai as genai
 
 # 環境変数からGCP設定を取得
 PROJECT_ID = os.environ.get('GCP_PROJECT_ID')
@@ -36,6 +37,7 @@ _handler = None
 _configuration = None
 _engine = None
 _connector = None
+_gemini_model = None
 
 
 def get_secret(secret_id: str) -> str:
@@ -121,6 +123,18 @@ def get_db_engine():
         )
 
     return _engine
+
+
+def get_gemini_model():
+    """Gemini Modelを取得（遅延初期化）"""
+    global _gemini_model
+
+    if _gemini_model is None:
+        gemini_api_key = get_secret('GEMINI_API_KEY')
+        genai.configure(api_key=gemini_api_key)
+        _gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
+
+    return _gemini_model
 
 
 @functions_framework.http
@@ -315,7 +329,8 @@ def process_profile_collection(user_id, message, relationship, prefecture, munic
             ).scalar()
 
             if task_count > 0:
-                return "メッセージを受け取りました。\n\n現在、AI機能を実装中です。しばらくお待ちください。"
+                # タスク生成済み - AI会話モード
+                return generate_ai_response(user_id, message)
             else:
                 # タスク生成
                 with engine.connect() as conn:
@@ -423,6 +438,111 @@ def process_profile_collection(user_id, message, relationship, prefecture, munic
 
             except ValueError:
                 return "日付の形式が正しくありません。\nYYYY-MM-DD形式で入力してください。\n（例：2024-01-15）"
+
+
+def generate_ai_response(user_id: str, user_message: str) -> str:
+    """Gemini APIを使ってAI応答を生成"""
+    engine = get_db_engine()
+    model = get_gemini_model()
+
+    # ユーザープロフィールとタスク情報を取得
+    with engine.connect() as conn:
+        profile_data = conn.execute(
+            sqlalchemy.text(
+                """
+                SELECT up.relationship, up.prefecture, up.municipality, up.death_date
+                FROM user_profiles up
+                WHERE up.user_id = :user_id
+                """
+            ),
+            {"user_id": user_id}
+        ).fetchone()
+
+        # 直近の会話履歴を取得（最新10件）
+        conversation_history = conn.execute(
+            sqlalchemy.text(
+                """
+                SELECT role, message
+                FROM conversation_history
+                WHERE user_id = :user_id
+                ORDER BY created_at DESC
+                LIMIT 10
+                """
+            ),
+            {"user_id": user_id}
+        ).fetchall()
+
+    # システムプロンプト作成
+    relationship = profile_data[0] if profile_data else "不明"
+    prefecture = profile_data[1] if profile_data else "不明"
+    municipality = profile_data[2] if profile_data else "不明"
+    death_date = profile_data[3].isoformat() if profile_data and profile_data[3] else "不明"
+
+    system_prompt = f"""あなたは「受け継ぐAI」という死後手続きサポートアシスタントです。
+
+【ユーザー情報】
+- 故人との関係: {relationship}
+- 住所: {prefecture} {municipality}
+- 死亡日: {death_date}
+
+【役割】
+- 死後の行政手続きに関する質問に親身に答える
+- 手続きの期限や必要書類について具体的にアドバイスする
+- 専門的な内容は分かりやすく説明する
+- 個人情報（電話番号、マイナンバー等）の入力は避けるよう注意を促す
+
+【回答スタイル】
+- 簡潔で分かりやすく（200文字以内）
+- 優しく丁寧な言葉遣い
+- 必要に応じて次のステップを提案する
+"""
+
+    # 会話履歴を逆順にして（古い順に）プロンプトに追加
+    conversation_context = ""
+    for i, (role, msg) in enumerate(reversed(conversation_history)):
+        if i >= 5:  # 直近5件のみ
+            break
+        if role == "user":
+            conversation_context += f"ユーザー: {msg}\n"
+        elif role == "assistant":
+            conversation_context += f"AI: {msg}\n"
+
+    # Gemini APIリクエスト
+    prompt = f"""{system_prompt}
+
+【直近の会話】
+{conversation_context}
+
+【現在のユーザーメッセージ】
+{user_message}
+
+【あなたの応答】"""
+
+    try:
+        response = model.generate_content(prompt)
+        ai_reply = response.text
+
+        # アシスタントの応答を会話履歴に保存
+        with engine.connect() as conn:
+            conn.execute(
+                sqlalchemy.text(
+                    """
+                    INSERT INTO conversation_history (user_id, role, message)
+                    VALUES (:user_id, 'assistant', :message)
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "message": ai_reply
+                }
+            )
+            conn.commit()
+
+        return ai_reply
+
+    except Exception as e:
+        print(f"Gemini API error: {str(e)}")
+        return "申し訳ございません。現在システムの調子が悪いようです。しばらく経ってから再度お試しください。"
 
 
 def handle_postback(event: PostbackEvent):
