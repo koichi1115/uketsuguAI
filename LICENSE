@@ -1,21 +1,32 @@
-MIT License
-
+非商用利用ライセンス（Non-Commercial Use License）
 Copyright (c) 2025 Sai ko
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+本ソフトウェアおよびソースコードは、以下の条件のもとで使用、複製、改変、再配布を許可します。
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. 本ソフトウェアは、**非商用目的（個人・教育・研究等）に限り**自由に使用できます。
+2. 本ソフトウェアの**商用利用（営利目的での販売・提供・組み込み・サービス利用など）を禁止**します。
+3. 本ソフトウェアの利用にあたっては、**上記の著作権表示およびこのライセンス文を保持**してください。
+4. 本ソフトウェアは「現状のまま」提供され、いかなる保証も行いません。利用によって生じたいかなる損害についても、著作権者は責任を負いません。
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+------------------------------------------------------------
+
+Non-Commercial Use License
+Copyright (c) 2025 Sai ko
+
+Permission is granted to use, copy, modify, and redistribute this software
+under the following conditions:
+
+1. This software may be used **for non-commercial purposes only** 
+   (e.g., personal, educational, or research use).
+2. **Commercial use** of this software, including selling, distributing, 
+   or using it in any for-profit service or product, is **prohibited**.
+3. The above copyright notice and this license text must be included 
+   in all copies or substantial portions of the software.
+4. This software is provided "as is", without warranty of any kind, 
+   express or implied, including but not limited to the warranties 
+   of merchantability, fitness for a particular purpose, and noninfringement.
+
+------------------------------------------------------------
+
+For commercial licensing or inquiries, please contact:
+（商用利用に関するお問い合わせは著作権者までご連絡ください）
