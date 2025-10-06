@@ -32,6 +32,7 @@ import sqlalchemy
 from datetime import datetime, timezone
 import google.generativeai as genai
 from flex_messages import create_task_list_flex, create_task_completed_flex
+from knowledge_base import search_knowledge
 
 # 環境変数からGCP設定を取得
 PROJECT_ID = os.environ.get('GCP_PROJECT_ID')
@@ -714,18 +715,35 @@ def generate_ai_response(user_id: str, user_message: str) -> str:
         elif role == "assistant":
             conversation_context += f"AI: {msg}\n"
 
-    # Gemini APIリクエスト
+    # ナレッジベースから関連情報を取得（RAG）
+    knowledge = search_knowledge(user_message)
+    knowledge_section = ""
+    if knowledge:
+        knowledge_section = f"""
+【参考情報（行政手続きナレッジベース）】
+{knowledge}
+"""
+
+    # Gemini APIリクエスト（RAG: ナレッジベース参照）
     prompt = f"""{system_prompt}
 
 【直近の会話】
 {conversation_context}
-
+{knowledge_section}
 【現在のユーザーメッセージ】
 {user_message}
+
+【指示】
+上記の参考情報を活用して、正確で具体的な回答をしてください。
+特に{prefecture}{municipality}の地域特有の情報があれば補足してください。
+参考情報にない内容については、一般的な知識で回答してください。
 
 【あなたの応答】"""
 
     try:
+        # TODO: Google Search Groundingは後で実装
+        # 現在のgoogle-generativeaiパッケージがGemini 2.0のgoogle_searchに未対応
+        # 代替案: プロンプトで最新情報の参照を促す
         response = model.generate_content(prompt)
         ai_reply = response.text
 
