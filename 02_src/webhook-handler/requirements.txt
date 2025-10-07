@@ -12,9 +12,10 @@ pg8000==1.*
 # Google Cloud
 google-cloud-secret-manager==2.*
 cloud-sql-python-connector==1.*
+google-cloud-tasks==2.*
 
-# AI
-google-generativeai>=0.8.0
+# AI - New Google Gen AI SDK
+google-genai>=0.2.0
 
 # Utilities
 python-dotenv==1.*

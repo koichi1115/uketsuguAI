@@ -12,6 +12,7 @@ from linebot.v3.messaging import (
     ApiClient,
     MessagingApi,
     ReplyMessageRequest,
+    PushMessageRequest,
     TextMessage,
     FlexMessage,
     FlexContainer,
@@ -28,9 +29,11 @@ from linebot.v3.webhooks import (
 )
 from google.cloud import secretmanager
 from google.cloud.sql.connector import Connector
+from google.cloud import tasks_v2
 import sqlalchemy
 from datetime import datetime, timezone
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from flex_messages import create_task_list_flex, create_task_completed_flex
 from knowledge_base import search_knowledge
 
@@ -43,7 +46,7 @@ _handler = None
 _configuration = None
 _engine = None
 _connector = None
-_gemini_model = None
+_gemini_client = None
 
 
 def get_secret(secret_id: str) -> str:
@@ -131,16 +134,163 @@ def get_db_engine():
     return _engine
 
 
-def get_gemini_model():
-    """Gemini Modelを取得（遅延初期化）"""
-    global _gemini_model
+def get_gemini_client():
+    """Gemini Clientを取得（遅延初期化）"""
+    global _gemini_client
 
-    if _gemini_model is None:
+    if _gemini_client is None:
         gemini_api_key = get_secret('GEMINI_API_KEY')
-        genai.configure(api_key=gemini_api_key)
-        _gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        _gemini_client = genai.Client(api_key=gemini_api_key)
 
-    return _gemini_model
+    return _gemini_client
+
+
+def enqueue_task_generation(user_id: str, line_user_id: str):
+    """
+    Cloud Tasksにタスク生成ジョブを投入
+
+    Args:
+        user_id: データベースのユーザーID（UUID）
+        line_user_id: LINEユーザーID（Push通知用）
+    """
+    client = tasks_v2.CloudTasksClient()
+
+    # Cloud Tasksのキュー名
+    queue_name = 'task-generation-queue'
+    parent = client.queue_path(PROJECT_ID, REGION, queue_name)
+
+    # ワーカーのURL（同じCloud Functionとしてデプロイ）
+    worker_url = f"https://{REGION}-{PROJECT_ID}.cloudfunctions.net/task-generator-worker"
+
+    # タスクペイロード（両方のIDを渡す）
+    payload = json.dumps({
+        'user_id': str(user_id),
+        'line_user_id': line_user_id
+    }).encode()
+
+    # Cloud Taskを作成（OIDC認証トークン付き）
+    task = {
+        'http_request': {
+            'http_method': tasks_v2.HttpMethod.POST,
+            'url': worker_url,
+            'headers': {'Content-Type': 'application/json'},
+            'body': payload,
+            'oidc_token': {
+                'service_account_email': 'webhook-handler@uketsuguai-dev.iam.gserviceaccount.com'
+            }
+        }
+    }
+
+    # タスクをキューに追加
+    response = client.create_task(request={'parent': parent, 'task': task})
+    print(f"📤 Cloud Taskを投入しました: {response.name}")
+
+
+@functions_framework.http
+def generate_tasks_worker(request: Request):
+    """
+    非同期タスク生成ワーカー
+
+    Cloud Tasksから呼び出され、タスクを生成してPush通知する
+    """
+    from task_generator import generate_basic_tasks, get_task_summary_message
+
+    # リクエストボディを取得
+    try:
+        request_json = request.get_json(silent=True)
+        if not request_json:
+            return jsonify({"error": "Invalid request body"}), 400
+
+        user_id = request_json.get('user_id')
+        line_user_id = request_json.get('line_user_id')
+
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+        if not line_user_id:
+            return jsonify({"error": "line_user_id is required"}), 400
+
+        print(f"🔄 タスク生成開始: user_id={user_id}, line_user_id={line_user_id}")
+
+        # データベース接続
+        engine = get_db_engine()
+
+        # ユーザープロフィールを取得
+        with engine.connect() as conn:
+            profile_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT relationship, prefecture, municipality, death_date
+                    FROM user_profiles
+                    WHERE user_id = :user_id
+                    """
+                ),
+                {"user_id": user_id}
+            ).fetchone()
+
+            if not profile_data:
+                print(f"⚠️ ユーザープロフィールが見つかりません: {user_id}")
+                return jsonify({"error": "User profile not found"}), 404
+
+            profile = {
+                'relationship': profile_data[0],
+                'prefecture': profile_data[1],
+                'municipality': profile_data[2],
+                'death_date': profile_data[3]
+            }
+
+        # タスク生成（この処理に5分程度かかる）
+        print(f"🔍 AI駆動型タスク生成中...")
+        tasks = generate_basic_tasks(user_id, profile, engine.connect())
+
+        print(f"✅ タスク生成完了: {len(tasks)}件")
+
+        # サマリーメッセージを作成
+        municipality = profile['municipality']
+        summary_message = get_task_summary_message(tasks, municipality)
+
+        # LINE Push APIで通知
+        configuration = get_configuration()
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+
+            line_bot_api.push_message(
+                PushMessageRequest(
+                    to=line_user_id,
+                    messages=[TextMessage(text=summary_message)]
+                )
+            )
+
+        print(f"📤 Push通知送信完了: line_user_id={line_user_id}")
+
+        return jsonify({
+            "status": "success",
+            "user_id": user_id,
+            "tasks_count": len(tasks)
+        }), 200
+
+    except Exception as e:
+        print(f"❌ タスク生成エラー: {e}")
+        import traceback
+        traceback.print_exc()
+
+        # エラー時もユーザーに通知
+        try:
+            if 'line_user_id' in locals() and line_user_id:
+                configuration = get_configuration()
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.push_message(
+                        PushMessageRequest(
+                            to=line_user_id,
+                            messages=[TextMessage(
+                                text="⚠️ タスク生成中にエラーが発生しました。\n\nお手数ですが、しばらく時間をおいて再度プロフィール登録をお試しください。"
+                            )]
+                        )
+                    )
+        except:
+            pass
+
+        return jsonify({"error": str(e)}), 500
 
 
 @functions_framework.http
@@ -311,7 +461,7 @@ def handle_message(event: MessageEvent):
 
     # プロフィール収集フロー
     reply_message = process_profile_collection(
-        user_id, user_message, relationship, prefecture, municipality, death_date
+        user_id, line_user_id, user_message, relationship, prefecture, municipality, death_date
     )
 
     with ApiClient(configuration) as api_client:
@@ -348,10 +498,8 @@ def handle_message(event: MessageEvent):
             )
 
 
-def process_profile_collection(user_id, message, relationship, prefecture, municipality, death_date):
+def process_profile_collection(user_id, line_user_id, message, relationship, prefecture, municipality, death_date):
     """プロフィール収集処理"""
-    from task_generator import generate_basic_tasks, get_task_summary_message
-
     engine = get_db_engine()
 
     # ヘルプと設定は常に表示可能
@@ -387,19 +535,19 @@ def process_profile_collection(user_id, message, relationship, prefecture, munic
                 else:
                     return generate_ai_response(user_id, message)
             else:
-                # タスク生成
-                with engine.connect() as conn:
-                    tasks = generate_basic_tasks(
-                        user_id,
-                        {
-                            'death_date': death_date,
-                            'prefecture': prefecture,
-                            'municipality': municipality
-                        },
-                        conn
-                    )
+                # タスク生成をCloud Tasksに投入（非同期）
+                enqueue_task_generation(user_id, line_user_id)
 
-                return get_task_summary_message(tasks, municipality)
+                return f"""✅ プロフィール登録が完了しました
+
+🤖 AIがあなた専用のタスクを生成中です...
+
+📍 {prefecture}{municipality}での手続き情報
+📅 死亡日: {death_date.strftime('%Y年%m月%d日') if hasattr(death_date, 'strftime') else str(death_date)}
+
+⏱️ 生成には5分程度かかります。完了したら通知でお知らせします。
+
+しばらくお待ちください。"""
 
     # プロフィール収集中
     with engine.connect() as conn:
@@ -530,18 +678,19 @@ def process_profile_collection(user_id, message, relationship, prefecture, munic
                 )
                 conn.commit()
 
-                # タスク生成
-                tasks = generate_basic_tasks(
-                    user_id,
-                    {
-                        'death_date': death_dt,
-                        'prefecture': prefecture or '（未設定）',
-                        'municipality': municipality or '（未設定）'
-                    },
-                    conn
-                )
+                # タスク生成をCloud Tasksに投入（非同期）
+                enqueue_task_generation(user_id, line_user_id)
 
-                return get_task_summary_message(tasks, municipality or '（未設定）')
+                return f"""✅ プロフィール登録が完了しました
+
+🤖 AIがあなた専用のタスクを生成中です...
+
+📍 {prefecture or '（未設定）'}{municipality or '（未設定）'}での手続き情報
+📅 死亡日: {death_dt.strftime('%Y年%m月%d日')}
+
+⏱️ 生成には5分程度かかります。完了したら通知でお知らせします。
+
+しばらくお待ちください。"""
 
             except ValueError:
                 return "日付の形式が正しくありません。\nYYYY-MM-DD形式で入力してください。\n（例：2024-01-15）"
@@ -660,7 +809,7 @@ def complete_task(user_id: str, message: str) -> str:
 def generate_ai_response(user_id: str, user_message: str) -> str:
     """Gemini APIを使ってAI応答を生成"""
     engine = get_db_engine()
-    model = get_gemini_model()
+    client = get_gemini_client()
 
     # ユーザープロフィールとタスク情報を取得
     with engine.connect() as conn:
@@ -751,10 +900,11 @@ def generate_ai_response(user_id: str, user_message: str) -> str:
 【あなたの応答】"""
 
     try:
-        # TODO: Google Search Groundingは後で実装
-        # 現在のgoogle-generativeaiパッケージがGemini 2.0のgoogle_searchに未対応
-        # 代替案: プロンプトで最新情報の参照を促す
-        response = model.generate_content(prompt)
+        # Gemini 2.5 Proで応答生成
+        response = client.models.generate_content(
+            model='gemini-2.5-pro',
+            contents=prompt
+        )
         ai_reply = response.text
 
         # アシスタントの応答を会話履歴に保存
@@ -1008,8 +1158,6 @@ def handle_postback(event: PostbackEvent):
 
     elif action == 'set_death_date':
         # Datetimepickerから日付を取得
-        from task_generator import generate_basic_tasks, get_task_summary_message
-
         selected_date = event.postback.params.get('date')  # YYYY-MM-DD形式
 
         # ユーザーIDを取得
@@ -1048,18 +1196,19 @@ def handle_postback(event: PostbackEvent):
                 )
                 conn.commit()
 
-                # タスク生成
-                tasks = generate_basic_tasks(
-                    user_id,
-                    {
-                        'death_date': death_dt,
-                        'prefecture': prefecture,
-                        'municipality': municipality
-                    },
-                    conn
-                )
+                # タスク生成をCloud Tasksに投入（非同期）
+                enqueue_task_generation(user_id, line_user_id)
 
-                reply_message = get_task_summary_message(tasks, municipality)
+                reply_message = f"""✅ 死亡日を登録しました
+
+🤖 AIがあなた専用のタスクを生成中です...
+
+📍 {prefecture}{municipality}での手続き情報
+📅 死亡日: {death_dt.strftime('%Y年%m月%d日')}
+
+⏱️ 生成には5分程度かかります。完了したら通知でお知らせします。
+
+しばらくお待ちください。"""
 
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
