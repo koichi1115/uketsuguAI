@@ -102,16 +102,36 @@ def create_task_list_flex(tasks, user_name="", show_all=False):
                     "margin": "sm"
                 },
                 {
-                    "type": "button",
-                    "action": {
-                        "type": "postback",
-                        "label": "✅ 完了",
-                        "data": f"action=complete_task&task_id={task_id}",
-                        "displayText": f"「{title}」を完了しました"
-                    },
-                    "style": "primary",
-                    "color": "#17C964",
-                    "height": "sm",
+                    "type": "box",
+                    "layout": "horizontal",
+                    "contents": [
+                        {
+                            "type": "button",
+                            "action": {
+                                "type": "postback",
+                                "label": "📋 詳細",
+                                "data": f"action=view_task_detail&task_id={task_id}",
+                                "displayText": f"「{title}」の詳細"
+                            },
+                            "style": "link",
+                            "height": "sm",
+                            "flex": 1
+                        },
+                        {
+                            "type": "button",
+                            "action": {
+                                "type": "postback",
+                                "label": "✅ 完了",
+                                "data": f"action=complete_task&task_id={task_id}",
+                                "displayText": f"「{title}」を完了しました"
+                            },
+                            "style": "primary",
+                            "color": "#17C964",
+                            "height": "sm",
+                            "flex": 1
+                        }
+                    ],
+                    "spacing": "sm",
                     "margin": "md"
                 }
             ],
@@ -288,5 +308,145 @@ def create_task_completed_flex(task_title):
                     "height": "sm"
                 }
             ]
+        }
+    }
+
+
+def create_task_detail_flex(task_info):
+    """
+    タスク詳細のFlex Messageを生成
+
+    Args:
+        task_info: タスク情報 (id, title, description, due_date, priority, category)
+
+    Returns:
+        Flex Message JSON
+    """
+    task_id, title, description, due_date, priority, category = task_info
+
+    # 優先度による絵文字設定
+    priority_emoji = "🔴" if priority == "high" else "🟡" if priority == "medium" else "⚪"
+    priority_text = "高" if priority == "high" else "中" if priority == "medium" else "低"
+
+    # 期限表示
+    due_str = due_date.strftime("%Y年%m月%d日") if due_date else "期限なし"
+
+    return {
+        "type": "bubble",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": "📋 タスク詳細",
+                    "weight": "bold",
+                    "size": "lg",
+                    "color": "#333333"
+                }
+            ],
+            "paddingAll": "15px",
+            "backgroundColor": "#F7F7F7"
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": title,
+                    "weight": "bold",
+                    "size": "xl",
+                    "wrap": True,
+                    "color": "#333333"
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "contents": [
+                        {
+                            "type": "box",
+                            "layout": "baseline",
+                            "contents": [
+                                {
+                                    "type": "text",
+                                    "text": priority_emoji,
+                                    "size": "sm",
+                                    "flex": 0
+                                },
+                                {
+                                    "type": "text",
+                                    "text": f"優先度: {priority_text}",
+                                    "size": "sm",
+                                    "color": "#999999",
+                                    "margin": "sm",
+                                    "flex": 0
+                                }
+                            ],
+                            "flex": 1
+                        },
+                        {
+                            "type": "text",
+                            "text": category,
+                            "size": "xs",
+                            "color": "#999999",
+                            "align": "end",
+                            "flex": 1
+                        }
+                    ],
+                    "margin": "md"
+                },
+                {
+                    "type": "box",
+                    "layout": "baseline",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": "📅",
+                            "size": "sm",
+                            "flex": 0
+                        },
+                        {
+                            "type": "text",
+                            "text": f"期限: {due_str}",
+                            "size": "sm",
+                            "color": "#999999",
+                            "margin": "sm",
+                            "flex": 1
+                        }
+                    ],
+                    "margin": "sm"
+                },
+                {
+                    "type": "separator",
+                    "margin": "lg"
+                },
+                {
+                    "type": "text",
+                    "text": description,
+                    "size": "sm",
+                    "wrap": True,
+                    "color": "#666666",
+                    "margin": "lg"
+                }
+            ],
+            "paddingAll": "20px"
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "button",
+                    "action": {
+                        "type": "message",
+                        "label": "タスク一覧に戻る",
+                        "text": "タスク"
+                    },
+                    "style": "link",
+                    "height": "sm"
+                }
+            ],
+            "paddingAll": "15px"
         }
     }

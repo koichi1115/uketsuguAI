@@ -791,7 +791,49 @@ def handle_postback(event: PostbackEvent):
     params = dict(param.split('=') for param in postback_data.split('&'))
     action = params.get('action', '')
 
-    if action == 'complete_task':
+    if action == 'view_task_detail':
+        task_id = params.get('task_id', '')
+
+        # タスク情報を取得
+        with engine.connect() as conn:
+            task_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT id, title, description, due_date, priority, category
+                    FROM tasks
+                    WHERE id = :task_id
+                    """
+                ),
+                {"task_id": task_id}
+            ).fetchone()
+
+            if not task_data:
+                reply_message = "タスクが見つかりません。"
+            else:
+                # タスク詳細のFlex Messageを生成
+                from flex_messages import create_task_detail_flex
+                reply_message = create_task_detail_flex(task_data)
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+
+            # Flex Messageかテキストメッセージか判定
+            if isinstance(reply_message, dict):
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[FlexMessage(alt_text="タスク詳細", contents=FlexContainer.from_dict(reply_message))]
+                    )
+                )
+            else:
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_message)]
+                    )
+                )
+
+    elif action == 'complete_task':
         task_id = params.get('task_id', '')
 
         # ユーザーIDを取得
