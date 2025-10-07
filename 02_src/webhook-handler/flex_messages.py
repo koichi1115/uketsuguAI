@@ -1,6 +1,114 @@
 """
 Flex Message テンプレート
 """
+import re
+
+
+def parse_text_with_links(text):
+    """
+    テキストから電話番号とURLを検出してFlexコンポーネントのリストに変換
+
+    Args:
+        text: パースするテキスト
+
+    Returns:
+        Flexコンポーネントのリスト
+    """
+    if not text:
+        return []
+
+    # URLと電話番号のパターン
+    url_pattern = r'https?://[^\s]+'
+    phone_pattern = r'(\d{2,5}-\d{1,4}-\d{4}|\d{10,11}(?!\d))'
+
+    # 両方のパターンを結合
+    combined_pattern = f'({url_pattern}|{phone_pattern})'
+
+    parts = []
+    last_end = 0
+
+    for match in re.finditer(combined_pattern, text):
+        # マッチ前のテキスト
+        if match.start() > last_end:
+            before_text = text[last_end:match.start()]
+            if before_text.strip():
+                parts.append({
+                    "type": "text",
+                    "text": before_text,
+                    "size": "sm",
+                    "wrap": True,
+                    "color": "#666666"
+                })
+
+        matched_text = match.group(0)
+
+        # URLか電話番号かを判定
+        if matched_text.startswith('http'):
+            # URL
+            parts.append({
+                "type": "text",
+                "text": matched_text,
+                "size": "sm",
+                "wrap": True,
+                "color": "#0066CC",
+                "decoration": "underline",
+                "action": {
+                    "type": "uri",
+                    "uri": matched_text
+                }
+            })
+        else:
+            # 電話番号
+            clean_phone = matched_text.replace('-', '')
+            if clean_phone.startswith('0') and len(clean_phone) in [10, 11]:
+                parts.append({
+                    "type": "text",
+                    "text": matched_text,
+                    "size": "sm",
+                    "wrap": True,
+                    "color": "#0066CC",
+                    "decoration": "underline",
+                    "action": {
+                        "type": "uri",
+                        "uri": f"tel:{clean_phone}"
+                    }
+                })
+            else:
+                # 電話番号でない数字列
+                parts.append({
+                    "type": "text",
+                    "text": matched_text,
+                    "size": "sm",
+                    "wrap": True,
+                    "color": "#666666"
+                })
+
+        last_end = match.end()
+
+    # 残りのテキスト
+    if last_end < len(text):
+        remaining_text = text[last_end:]
+        if remaining_text.strip():
+            parts.append({
+                "type": "text",
+                "text": remaining_text,
+                "size": "sm",
+                "wrap": True,
+                "color": "#666666"
+            })
+
+    # パーツがない場合は元のテキストを返す
+    if not parts:
+        parts.append({
+            "type": "text",
+            "text": text,
+            "size": "sm",
+            "wrap": True,
+            "color": "#666666"
+        })
+
+    return parts
+
 
 def create_task_list_flex(tasks, user_name="", show_all=False):
     """
@@ -422,12 +530,11 @@ def create_task_detail_flex(task_info):
                     "margin": "lg"
                 },
                 {
-                    "type": "text",
-                    "text": description,
-                    "size": "sm",
-                    "wrap": True,
-                    "color": "#666666",
-                    "margin": "lg"
+                    "type": "box",
+                    "layout": "vertical",
+                    "contents": parse_text_with_links(description),
+                    "margin": "lg",
+                    "spacing": "xs"
                 }
             ],
             "paddingAll": "20px"

@@ -1,7 +1,7 @@
 """
 AI駆動型パーソナライズタスク生成モジュール
 
-Gemini 2.0 Flash + Google Search Groundingを使用して、
+Gemini 2.5 Pro + Google Search Groundingを使用して、
 ユーザープロフィールに完全に最適化されたタスクを生成する
 """
 
@@ -10,7 +10,8 @@ from typing import List, Dict
 import sqlalchemy
 import os
 import json
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from google.cloud import secretmanager
 
 
@@ -54,9 +55,9 @@ def generate_basic_tasks(user_id: str, profile: Dict, conn) -> List[Dict]:
     if isinstance(death_date, str):
         death_date = datetime.fromisoformat(death_date)
 
-    # Gemini APIを初期化
+    # Gemini APIクライアントを初期化
     gemini_api_key = get_secret('GEMINI_API_KEY')
-    genai.configure(api_key=gemini_api_key)
+    client = genai.Client(api_key=gemini_api_key)
 
     # タスクスキーマ定義
     task_schema = {
@@ -92,7 +93,7 @@ def generate_basic_tasks(user_id: str, profile: Dict, conn) -> List[Dict]:
                         },
                         "tips": {
                             "type": "string",
-                            "description": "具体的なヒント、注意点、スムーズに進めるコツ"
+                            "description": "具体的なヒント、注意点、スムーズに進めるコツ。SNS・ブログ・口コミから収集した実用的なTips（便利技、お得情報、時短テクニック）を含める"
                         },
                         "legal_basis": {
                             "type": "string",
@@ -115,8 +116,13 @@ def generate_basic_tasks(user_id: str, profile: Dict, conn) -> List[Dict]:
         "required": ["tasks"]
     }
 
-    # プロンプト作成
-    prompt = f"""あなたは死後手続きの専門家です。以下のユーザー情報に基づき、完全にパーソナライズされた手続きタスクを生成してください。
+    try:
+        print("🔍 Google検索を使用してリアルタイム情報収集＋タスク生成中...")
+
+        # 2段階アプローチ: グラウンディングとJSON Schemaは同時使用不可のため
+        # 第1段階: Google Search Groundingで情報収集
+        # 第2段階: 収集した情報をJSON Schemaで構造化
+        prompt = f"""あなたは死後手続きの専門家です。Google検索を活用して、以下のユーザー情報に基づき、最新かつ完全にパーソナライズされた手続きタスクを生成してください。
 
 【ユーザー情報】
 - 故人との関係: {relationship}
@@ -125,62 +131,80 @@ def generate_basic_tasks(user_id: str, profile: Dict, conn) -> List[Dict]:
 
 【タスク生成の要件】
 1. **完全パーソナライズ**
-   - 関係性に応じた手続き（配偶者→遺族年金、子→相続など）
-   - {municipality}の具体的な窓口情報を含める
+   - {relationship}として必要な手続き（配偶者→遺族年金、子→相続など）
+   - {prefecture}{municipality}の具体的な窓口情報を含める
    - 死亡日から期限を正確に計算
 
-2. **Web検索で最新情報を取得**
-   - e-gov（電子政府総合窓口）で法的根拠を確認
-   - {prefecture}{municipality}の公式サイトで窓口情報を取得
-   - 法務省、厚労省、国税庁などの公的機関の最新情報
+2. **Google検索で最新の公的情報を取得**
+   - e-gov（電子政府総合窓口）で各手続きの法的根拠を検索
+   - {prefecture}{municipality}の公式サイトで窓口情報（部署名、電話番号、URL）を検索
+   - 法務省、厚労省、国税庁の最新情報を検索
 
-3. **具体的で実用的な内容**
+3. **Google検索でSNS・ブログから実用的なTipsを収集**
+   - X（旧Twitter）で「死後手続き やっておくと楽」「知らないと損」を検索
+   - ブログ記事から「事前に準備しておくべき書類」の具体例を検索
+   - 「このタイミングでやっておくと後が楽」という時短テクニックを検索
+   - 「補助金がもらえる」「手数料が戻ってくる」などのお得情報を検索
+   - 「窓口に持っていくべきもの」リストを検索
+   - 「これをやっておけば良かった」という後悔談を検索
+
+4. **具体的で実用的な内容**
    - 必要書類を明記
    - 具体的な窓口名、連絡先、URLを含める
    - 手続きのコツや注意点を記載
    - 法的根拠（条文）を明記
 
-4. **優先順位**
+5. **優先順位**
    - 期限が短い、法的義務がある手続きは priority: high
    - 重要だが期限に余裕があるものは medium
    - 任意性が高いものは low
 
-【必須タスク例】
-- 死亡届の提出（7日以内）
-- 火葬許可申請
-- 年金受給停止
-- 健康保険証の返却
-- 介護保険資格喪失届
-- 世帯主変更届
-- 相続放棄の検討（3ヶ月以内）
-- 準確定申告（4ヶ月以内）
-- 相続税の申告（10ヶ月以内）
-- 公共料金の名義変更
-- 銀行口座の手続き
-- クレジットカードの解約
+【必須タスク】
+死亡届、火葬許可、年金停止、健康保険返却、介護保険、世帯主変更、相続放棄、準確定申告、相続税、公共料金、銀行口座、クレジットカード
 
-上記を含め、{relationship}として必要な手続きを10〜15件程度生成してください。
-Web検索を活用して、{municipality}の具体的な情報と最新の法的根拠を含めてください。
+上記を含め、{relationship}として必要な手続きを10〜15件生成してください。
+各タスクのtipsフィールドには、実際に役立つ具体的なアドバイスを含めてください。
 """
 
-    try:
-        # Gemini 2.0 Flash with Google Search Grounding
-        model = genai.GenerativeModel(
-            'gemini-2.0-flash-exp',
-            generation_config={
-                "response_mime_type": "application/json",
-                "response_schema": task_schema
-            }
+        # 第1段階: Gemini 2.5 ProでGoogle Search Groundingを使用して情報収集
+        grounding_response = client.models.generate_content(
+            model='gemini-2.5-pro',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())]
+            )
         )
 
-        # Google Search有効化（一旦無効化してテスト）
-        response = model.generate_content(
-            prompt
-            # tools='google_search_retrieval'  # 一旦コメントアウト
+        collected_info = grounding_response.text
+
+        print(f"✅ 情報収集完了: {len(collected_info)}文字")
+        print("📋 JSON形式でタスク生成中...")
+
+        # 第2段階: 収集した情報をJSON Schemaで構造化
+        structuring_prompt = f"""以下は、Google検索で収集した最新の手続き情報です。
+この情報をもとに、JSON形式でタスクリストを生成してください。
+
+【収集した情報】
+{collected_info}
+
+【タスク生成の要件】
+- 上記の情報から具体的なタスクを抽出
+- 必要書類、窓口情報、法的根拠、実用的なTipsを含める
+- 各タスクは10〜15件程度
+- カテゴリ、優先度、期限を適切に設定
+"""
+
+        structuring_response = client.models.generate_content(
+            model='gemini-2.5-pro',
+            contents=structuring_prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type='application/json',
+                response_schema=task_schema
+            )
         )
 
         # レスポンスをパース
-        result = json.loads(response.text)
+        result = json.loads(structuring_response.text)
         generated_tasks = result.get('tasks', [])
 
         print(f"✅ AI生成タスク数: {len(generated_tasks)}件")
@@ -334,9 +358,16 @@ def get_task_summary_message(tasks: List[Dict], municipality: str) -> str:
         サマリーメッセージ
     """
 
+    from datetime import datetime
+    today_str = datetime.now().strftime('%Y年%m月%d日')
+
     message = f"""✅ {municipality}での手続きタスクを{len(tasks)}件生成しました
 
-🤖 AIがあなたの状況に合わせて、e-govや自治体サイトから最新情報を取得し、完全にパーソナライズされたタスクを作成しました。
+🤖 Gemini 2.5 ProがGoogle検索を使用して、{today_str}時点の最新情報をもとに、完全にパーソナライズされたタスクを作成しました。
+
+📍 e-gov、{municipality}公式サイト、SNS・ブログから実用的なTipsを収集しています。
+
+⚠️ **重要**: 最新の情報は各窓口・公式サイトで再度ご確認ください。
 
 優先度の高いタスク（期限が近いもの）:
 """
