@@ -468,7 +468,32 @@ def handle_message(event: MessageEvent):
         line_bot_api = MessagingApi(api_client)
 
         # 返信メッセージの種類を判定
-        if isinstance(reply_message, dict):
+        if isinstance(reply_message, list):
+            # 複数メッセージ（リスト）
+            messages = []
+            for msg in reply_message:
+                if isinstance(msg, dict):
+                    if msg.get("type") == "flex":
+                        messages.append(FlexMessage(alt_text=msg.get("altText", "メッセージ"), contents=FlexContainer.from_dict(msg["contents"])))
+                    else:
+                        # Flex Messageのコンテナ（bubble等）
+                        alt_text = "メッセージ"
+                        if msg.get("header", {}).get("contents"):
+                            header_text = msg["header"]["contents"][0].get("text", "")
+                            if header_text:
+                                alt_text = header_text.replace("📋 ", "").replace("⚙️ ", "")
+                        messages.append(FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(msg)))
+                else:
+                    # テキスト
+                    messages.append(TextMessage(text=str(msg)))
+
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=messages
+                )
+            )
+        elif isinstance(reply_message, dict):
             if reply_message.get("type") == "text_with_quick_reply":
                 # Quick Reply付きテキストメッセージ
                 line_bot_api.reply_message(
@@ -524,6 +549,94 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
             {"user_id": user_id}
         ).fetchone()
 
+        # タスク追加フローのチェック
+        if last_system_message and last_system_message[0].startswith('adding_task:'):
+            parts = last_system_message[0].split(':')
+            adding_step = parts[1]
+
+            # フラグをクリア
+            conn.execute(
+                sqlalchemy.text(
+                    """
+                    DELETE FROM conversation_history
+                    WHERE user_id = :user_id AND role = 'system' AND message LIKE 'adding_task:%'
+                    """
+                ),
+                {"user_id": user_id}
+            )
+            conn.commit()
+
+            if adding_step == 'title':
+                # タイトル入力後、期限選択へ
+                task_title = message
+
+                # タイトルを一時保存
+                conn.execute(
+                    sqlalchemy.text(
+                        """
+                        INSERT INTO conversation_history (user_id, role, message)
+                        VALUES (:user_id, 'system', :data)
+                        """
+                    ),
+                    {"user_id": user_id, "data": f"adding_task:due_date:{task_title}"}
+                )
+                conn.commit()
+
+                return {
+                    "type": "text_with_quick_reply",
+                    "text": f"タスク「{task_title}」の期限を選択してください",
+                    "quick_reply": QuickReply(
+                        items=[
+                            QuickReplyItem(
+                                action=DatetimePickerAction(
+                                    label="📅 期限を選択",
+                                    data="action=add_task_due_date",
+                                    mode="date"
+                                )
+                            ),
+                            QuickReplyItem(
+                                action=MessageAction(label="期限なし", text="期限なし")
+                            )
+                        ]
+                    )
+                }
+
+            elif adding_step == 'due_date':
+                # 期限「なし」が選択された場合
+                if message == "期限なし":
+                    # タイトルを取得
+                    if len(parts) >= 3:
+                        task_title = ':'.join(parts[2:])
+
+                        # タスクを追加（期限なし）
+                        max_order = conn.execute(
+                            sqlalchemy.text("SELECT COALESCE(MAX(order_index), 0) FROM tasks WHERE user_id = :user_id"),
+                            {"user_id": user_id}
+                        ).scalar()
+
+                        conn.execute(
+                            sqlalchemy.text(
+                                """
+                                INSERT INTO tasks (user_id, title, description, category, priority, status, order_index)
+                                VALUES (:user_id, :title, :description, :category, :priority, 'pending', :order_index)
+                                """
+                            ),
+                            {
+                                "user_id": user_id,
+                                "title": task_title,
+                                "description": "手動で追加されたタスク",
+                                "category": "その他",
+                                "priority": "medium",
+                                "order_index": max_order + 1
+                            }
+                        )
+                        conn.commit()
+
+                        return f"✅ タスク「{task_title}」を追加しました"
+                    else:
+                        return "エラーが発生しました。もう一度お試しください。"
+
+        # 編集フローのチェック
         if last_system_message and last_system_message[0].startswith('editing:'):
             editing_field = last_system_message[0].split(':')[1]
 
@@ -653,6 +766,71 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
                 else:
                     return "エラーが発生しました。もう一度お試しください。"
 
+        elif last_system_message and last_system_message[0].startswith('editing_memo:'):
+            # メモ編集処理
+            task_id = last_system_message[0].split(':')[1]
+
+            # 編集フラグをクリア
+            conn.execute(
+                sqlalchemy.text(
+                    """
+                    DELETE FROM conversation_history
+                    WHERE user_id = :user_id AND role = 'system' AND message LIKE 'editing_memo:%'
+                    """
+                ),
+                {"user_id": user_id}
+            )
+            conn.commit()
+
+            # メモを保存
+            import json
+            memo_text = message.strip()
+
+            if memo_text:
+                # メモがある場合は保存
+                metadata = json.dumps({"memo": memo_text})
+            else:
+                # 空白の場合はメモを削除
+                metadata = json.dumps({"memo": ""})
+
+            conn.execute(
+                sqlalchemy.text(
+                    """
+                    UPDATE tasks
+                    SET metadata = CAST(:metadata AS jsonb)
+                    WHERE id = :task_id
+                    """
+                ),
+                {"task_id": task_id, "metadata": metadata}
+            )
+            conn.commit()
+
+            # 成功メッセージとタスク詳細を返す
+            task_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT id, title, description, due_date, priority, category, metadata
+                    FROM tasks
+                    WHERE id = :task_id
+                    """
+                ),
+                {"task_id": task_id}
+            ).fetchone()
+
+            if task_data:
+                from flex_messages import create_task_detail_flex
+                success_message = "✅ メモを保存しました" if memo_text else "✅ メモを削除しました"
+                return [
+                    success_message,
+                    {
+                        "type": "flex",
+                        "altText": "タスク詳細",
+                        "contents": create_task_detail_flex(task_data)
+                    }
+                ]
+            else:
+                return "タスクが見つかりません。"
+
     # ヘルプと設定は常に表示可能
     if message == 'ヘルプ':
         return get_help_message()
@@ -676,6 +854,20 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
                     return get_task_list_message(user_id)
                 elif message == '全タスク':
                     return get_task_list_message(user_id, show_all=True)
+                elif message in ['タスク追加', 'タスク追加', '追加']:
+                    # タスク追加フローを開始
+                    with engine.connect() as conn:
+                        conn.execute(
+                            sqlalchemy.text(
+                                """
+                                INSERT INTO conversation_history (user_id, role, message)
+                                VALUES (:user_id, 'system', 'adding_task:title')
+                                """
+                            ),
+                            {"user_id": user_id}
+                        )
+                        conn.commit()
+                    return "追加するタスクのタイトルを入力してください"
                 elif message == 'ヘルプ':
                     return get_help_message()
                 elif message == '設定':
@@ -855,7 +1047,7 @@ def get_task_list_message(user_id: str, show_all: bool = False):
         tasks = conn.execute(
             sqlalchemy.text(
                 """
-                SELECT id, title, due_date, status, priority, category
+                SELECT id, title, due_date, status, priority, category, metadata
                 FROM tasks
                 WHERE user_id = :user_id AND is_deleted = false
                 ORDER BY
@@ -1100,7 +1292,7 @@ def handle_postback(event: PostbackEvent):
             task_data = conn.execute(
                 sqlalchemy.text(
                     """
-                    SELECT id, title, description, due_date, priority, category
+                    SELECT id, title, description, due_date, priority, category, metadata
                     FROM tasks
                     WHERE id = :task_id
                     """
@@ -1604,6 +1796,144 @@ def handle_postback(event: PostbackEvent):
                         messages=[TextMessage(text=reply_message)]
                     )
                 )
+
+    elif action == 'add_task_due_date':
+        # Datetimepickerで選択された期限でタスクを追加
+        selected_date = event.postback.params.get('date')  # YYYY-MM-DD形式
+
+        with engine.connect() as conn:
+            user_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT u.id
+                    FROM users u
+                    WHERE u.line_user_id = :line_user_id
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            ).fetchone()
+
+            if not user_data:
+                reply_message = "ユーザー情報が見つかりません。"
+            else:
+                user_id = user_data[0]
+
+                # タイトルを取得
+                last_system_message = conn.execute(
+                    sqlalchemy.text(
+                        """
+                        SELECT message
+                        FROM conversation_history
+                        WHERE user_id = :user_id AND role = 'system' AND message LIKE 'adding_task:due_date:%'
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"user_id": user_id}
+                ).fetchone()
+
+                if last_system_message:
+                    parts = last_system_message[0].split(':')
+                    if len(parts) >= 3:
+                        task_title = ':'.join(parts[2:])
+
+                        # フラグをクリア
+                        conn.execute(
+                            sqlalchemy.text(
+                                """
+                                DELETE FROM conversation_history
+                                WHERE user_id = :user_id AND role = 'system' AND message LIKE 'adding_task:%'
+                                """
+                            ),
+                            {"user_id": user_id}
+                        )
+
+                        # タスクを追加
+                        from datetime import datetime as dt
+                        due_dt = dt.fromisoformat(selected_date)
+
+                        max_order = conn.execute(
+                            sqlalchemy.text("SELECT COALESCE(MAX(order_index), 0) FROM tasks WHERE user_id = :user_id"),
+                            {"user_id": user_id}
+                        ).scalar()
+
+                        conn.execute(
+                            sqlalchemy.text(
+                                """
+                                INSERT INTO tasks (user_id, title, description, category, priority, due_date, status, order_index)
+                                VALUES (:user_id, :title, :description, :category, :priority, :due_date, 'pending', :order_index)
+                                """
+                            ),
+                            {
+                                "user_id": user_id,
+                                "title": task_title,
+                                "description": "手動で追加されたタスク",
+                                "category": "その他",
+                                "priority": "medium",
+                                "due_date": due_dt,
+                                "order_index": max_order + 1
+                            }
+                        )
+                        conn.commit()
+
+                        reply_message = f"✅ タスク「{task_title}」を追加しました\n期限: {due_dt.strftime('%Y年%m月%d日')}"
+                    else:
+                        reply_message = "エラーが発生しました。もう一度お試しください。"
+                else:
+                    reply_message = "エラーが発生しました。もう一度お試しください。"
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_message)]
+                )
+            )
+
+    elif action == 'edit_memo':
+        # メモ編集モードに入る
+        task_id = event.postback.data.split('task_id=')[1]
+
+        with engine.connect() as conn:
+            user_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT u.id
+                    FROM users u
+                    WHERE u.line_user_id = :line_user_id
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            ).fetchone()
+
+            if user_data:
+                user_id = user_data[0]
+
+                # editing_memoフラグを設定
+                conn.execute(
+                    sqlalchemy.text(
+                        """
+                        INSERT INTO conversation_history (user_id, role, message)
+                        VALUES (:user_id, 'system', :data)
+                        """
+                    ),
+                    {"user_id": user_id, "data": f"editing_memo:{task_id}"}
+                )
+                conn.commit()
+
+                reply_message = "メモを入力してください。\n\n空白のメッセージを送信するとメモが削除されます。"
+            else:
+                reply_message = "ユーザー情報が見つかりません。"
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_message)]
+                )
+            )
 
     elif action == 'regenerate_tasks':
         # 既存タスクを削除してタスクを再生成

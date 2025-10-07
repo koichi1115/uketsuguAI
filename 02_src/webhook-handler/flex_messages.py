@@ -115,7 +115,7 @@ def create_task_list_flex(tasks, user_name="", show_all=False):
     タスク一覧のFlex Messageを生成（縦スクロール形式）
 
     Args:
-        tasks: タスクのリスト [(id, title, due_date, status, priority, category), ...]
+        tasks: タスクのリスト [(id, title, due_date, status, priority, category, metadata), ...]
         user_name: ユーザー名（オプション）
         show_all: 全件表示するかどうか（デフォルトは先頭5件のみ）
 
@@ -152,13 +152,26 @@ def create_task_list_flex(tasks, user_name="", show_all=False):
     # 未完了タスク（show_all=Trueなら全件、Falseなら最大5件）
     display_count = len(pending_tasks) if show_all else min(5, len(pending_tasks))
     for i, task in enumerate(pending_tasks[:display_count]):
-        task_id, title, due_date, status, priority, category = task
+        task_id, title, due_date, status, priority, category, metadata = task
 
         # 優先度による絵文字設定
         priority_emoji = "🔴" if priority == "high" else "🟡" if priority == "medium" else "⚪"
 
         # 期限表示
         due_str = due_date.strftime("%m/%d") if due_date else "期限なし"
+
+        # メモアイコン
+        import json
+        has_memo = False
+        if metadata:
+            if isinstance(metadata, str):
+                metadata_dict = json.loads(metadata)
+            else:
+                metadata_dict = metadata
+            memo = metadata_dict.get("memo", "")
+            has_memo = bool(memo.strip())
+
+        title_with_icon = f"{title} 📝" if has_memo else title
 
         # タスクボックス
         task_box = {
@@ -177,7 +190,7 @@ def create_task_list_flex(tasks, user_name="", show_all=False):
                         },
                         {
                             "type": "text",
-                            "text": title,
+                            "text": title_with_icon,
                             "weight": "bold",
                             "size": "md",
                             "flex": 5,
@@ -302,7 +315,19 @@ def create_task_list_flex(tasks, user_name="", show_all=False):
         # 完了済みタスク（show_all=Trueなら全件、Falseなら最新3件）
         completed_display_count = len(completed_tasks) if show_all else min(3, len(completed_tasks))
         for i, task in enumerate(completed_tasks[:completed_display_count]):
-            task_id, title, due_date, status, priority, category = task
+            task_id, title, due_date, status, priority, category, metadata = task
+
+            # メモアイコン
+            has_memo = False
+            if metadata:
+                if isinstance(metadata, str):
+                    metadata_dict = json.loads(metadata)
+                else:
+                    metadata_dict = metadata
+                memo = metadata_dict.get("memo", "")
+                has_memo = bool(memo.strip())
+
+            title_with_icon = f"{title} 📝" if has_memo else title
 
             # 完了済みタスクボックス（横並び）
             completed_task_box = {
@@ -311,7 +336,7 @@ def create_task_list_flex(tasks, user_name="", show_all=False):
                 "contents": [
                     {
                         "type": "text",
-                        "text": f"✅ {title}",
+                        "text": f"✅ {title_with_icon}",
                         "size": "sm",
                         "color": "#666666",
                         "wrap": True,
@@ -425,12 +450,12 @@ def create_task_detail_flex(task_info):
     タスク詳細のFlex Messageを生成
 
     Args:
-        task_info: タスク情報 (id, title, description, due_date, priority, category)
+        task_info: タスク情報 (id, title, description, due_date, priority, category, metadata)
 
     Returns:
         Flex Message JSON
     """
-    task_id, title, description, due_date, priority, category = task_info
+    task_id, title, description, due_date, priority, category, metadata = task_info
 
     # 優先度による絵文字設定
     priority_emoji = "🔴" if priority == "high" else "🟡" if priority == "medium" else "⚪"
@@ -438,6 +463,138 @@ def create_task_detail_flex(task_info):
 
     # 期限表示
     due_str = due_date.strftime("%Y年%m月%d日") if due_date else "期限なし"
+
+    # メモを取得
+    import json
+    memo = ""
+    if metadata:
+        if isinstance(metadata, str):
+            metadata_dict = json.loads(metadata)
+        else:
+            metadata_dict = metadata
+        memo = metadata_dict.get("memo", "")
+
+    # Body contents
+    body_contents = [
+        {
+            "type": "text",
+            "text": title,
+            "weight": "bold",
+            "size": "xl",
+            "wrap": True,
+            "color": "#333333"
+        },
+        {
+            "type": "box",
+            "layout": "horizontal",
+            "contents": [
+                {
+                    "type": "box",
+                    "layout": "baseline",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": priority_emoji,
+                            "size": "sm",
+                            "flex": 0
+                        },
+                        {
+                            "type": "text",
+                            "text": f"優先度: {priority_text}",
+                            "size": "sm",
+                            "color": "#999999",
+                            "margin": "sm",
+                            "flex": 0
+                        }
+                    ],
+                    "flex": 1
+                },
+                {
+                    "type": "text",
+                    "text": category,
+                    "size": "xs",
+                    "color": "#999999",
+                    "align": "end",
+                    "flex": 1
+                }
+            ],
+            "margin": "md"
+        },
+        {
+            "type": "box",
+            "layout": "baseline",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": "📅",
+                    "size": "sm",
+                    "flex": 0
+                },
+                {
+                    "type": "text",
+                    "text": f"期限: {due_str}",
+                    "size": "sm",
+                    "color": "#999999",
+                    "margin": "sm",
+                    "flex": 1
+                }
+            ],
+            "margin": "sm"
+        },
+        {
+            "type": "separator",
+            "margin": "lg"
+        },
+        {
+            "type": "box",
+            "layout": "vertical",
+            "contents": parse_text_with_links(description),
+            "margin": "lg",
+            "spacing": "xs"
+        }
+    ]
+
+    # メモセクション追加
+    body_contents.extend([
+        {
+            "type": "separator",
+            "margin": "lg"
+        },
+        {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": "📝 メモ",
+                    "weight": "bold",
+                    "size": "md",
+                    "color": "#333333"
+                },
+                {
+                    "type": "text",
+                    "text": memo if memo else "メモはまだありません",
+                    "size": "sm",
+                    "color": "#666666" if memo else "#999999",
+                    "wrap": True,
+                    "margin": "md"
+                },
+                {
+                    "type": "button",
+                    "action": {
+                        "type": "postback",
+                        "label": "✏️ メモを編集",
+                        "data": f"action=edit_memo&task_id={task_id}",
+                        "displayText": "メモを編集"
+                    },
+                    "style": "link",
+                    "height": "sm",
+                    "margin": "md"
+                }
+            ],
+            "margin": "lg"
+        }
+    ])
 
     return {
         "type": "bubble",
@@ -459,84 +616,7 @@ def create_task_detail_flex(task_info):
         "body": {
             "type": "box",
             "layout": "vertical",
-            "contents": [
-                {
-                    "type": "text",
-                    "text": title,
-                    "weight": "bold",
-                    "size": "xl",
-                    "wrap": True,
-                    "color": "#333333"
-                },
-                {
-                    "type": "box",
-                    "layout": "horizontal",
-                    "contents": [
-                        {
-                            "type": "box",
-                            "layout": "baseline",
-                            "contents": [
-                                {
-                                    "type": "text",
-                                    "text": priority_emoji,
-                                    "size": "sm",
-                                    "flex": 0
-                                },
-                                {
-                                    "type": "text",
-                                    "text": f"優先度: {priority_text}",
-                                    "size": "sm",
-                                    "color": "#999999",
-                                    "margin": "sm",
-                                    "flex": 0
-                                }
-                            ],
-                            "flex": 1
-                        },
-                        {
-                            "type": "text",
-                            "text": category,
-                            "size": "xs",
-                            "color": "#999999",
-                            "align": "end",
-                            "flex": 1
-                        }
-                    ],
-                    "margin": "md"
-                },
-                {
-                    "type": "box",
-                    "layout": "baseline",
-                    "contents": [
-                        {
-                            "type": "text",
-                            "text": "📅",
-                            "size": "sm",
-                            "flex": 0
-                        },
-                        {
-                            "type": "text",
-                            "text": f"期限: {due_str}",
-                            "size": "sm",
-                            "color": "#999999",
-                            "margin": "sm",
-                            "flex": 1
-                        }
-                    ],
-                    "margin": "sm"
-                },
-                {
-                    "type": "separator",
-                    "margin": "lg"
-                },
-                {
-                    "type": "box",
-                    "layout": "vertical",
-                    "contents": parse_text_with_links(description),
-                    "margin": "lg",
-                    "spacing": "xs"
-                }
-            ],
+            "contents": body_contents,
             "paddingAll": "20px"
         },
         "footer": {
