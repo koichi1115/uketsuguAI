@@ -482,10 +482,17 @@ def handle_message(event: MessageEvent):
                 )
             else:
                 # Flex Message
+                # alt_textをヘッダーテキストから取得（なければデフォルト）
+                alt_text = "メッセージ"
+                if reply_message.get("header", {}).get("contents"):
+                    header_text = reply_message["header"]["contents"][0].get("text", "")
+                    if header_text:
+                        alt_text = header_text.replace("📋 ", "").replace("⚙️ ", "")
+
                 line_bot_api.reply_message(
                     ReplyMessageRequest(
                         reply_token=event.reply_token,
-                        messages=[FlexMessage(alt_text="タスク一覧", contents=FlexContainer.from_dict(reply_message))]
+                        messages=[FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(reply_message))]
                     )
                 )
         else:
@@ -501,6 +508,150 @@ def handle_message(event: MessageEvent):
 def process_profile_collection(user_id, line_user_id, message, relationship, prefecture, municipality, death_date):
     """プロフィール収集処理"""
     engine = get_db_engine()
+
+    # 編集モードのチェック
+    with engine.connect() as conn:
+        last_system_message = conn.execute(
+            sqlalchemy.text(
+                """
+                SELECT message
+                FROM conversation_history
+                WHERE user_id = :user_id AND role = 'system'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ),
+            {"user_id": user_id}
+        ).fetchone()
+
+        if last_system_message and last_system_message[0].startswith('editing:'):
+            editing_field = last_system_message[0].split(':')[1]
+
+            # 編集フラグをクリア
+            conn.execute(
+                sqlalchemy.text(
+                    """
+                    DELETE FROM conversation_history
+                    WHERE user_id = :user_id AND role = 'system' AND message LIKE 'editing:%'
+                    """
+                ),
+                {"user_id": user_id}
+            )
+            conn.commit()
+
+            # 各フィールドの更新処理
+            if editing_field == 'relationship':
+                # 故人との関係を更新
+                conn.execute(
+                    sqlalchemy.text(
+                        """
+                        UPDATE user_profiles
+                        SET relationship = :relationship
+                        WHERE user_id = :user_id
+                        """
+                    ),
+                    {"user_id": user_id, "relationship": message}
+                )
+                conn.commit()
+                return f"✅ 故人との関係を「{message}」に変更しました"
+
+            elif editing_field == 'prefecture':
+                # 都道府県選択後、市区町村入力へ
+                # 都道府県を一時保存
+                conn.execute(
+                    sqlalchemy.text(
+                        """
+                        DELETE FROM conversation_history
+                        WHERE user_id = :user_id AND role = 'system' AND message LIKE 'editing:%'
+                        """
+                    ),
+                    {"user_id": user_id}
+                )
+                conn.execute(
+                    sqlalchemy.text(
+                        """
+                        INSERT INTO conversation_history (user_id, role, message)
+                        VALUES (:user_id, 'system', :prefecture_data)
+                        """
+                    ),
+                    {"user_id": user_id, "prefecture_data": f"editing:municipality:{message}"}
+                )
+                conn.commit()
+
+                return f"{message}の市区町村名を入力してください。\n\n例：新宿区、横浜市"
+
+            elif editing_field == 'municipality':
+                # 市区町村入力（都道府県はconversation_historyに保存済み）
+                # 都道府県を取得
+                parts = last_system_message[0].split(':')
+                if len(parts) >= 3:
+                    stored_prefecture = parts[2]
+
+                    conn.execute(
+                        sqlalchemy.text(
+                            """
+                            UPDATE user_profiles
+                            SET prefecture = :prefecture, municipality = :municipality
+                            WHERE user_id = :user_id
+                            """
+                        ),
+                        {"user_id": user_id, "prefecture": stored_prefecture, "municipality": message}
+                    )
+                    conn.commit()
+
+                    # タスク再生成確認
+                    return {
+                        "type": "bubble",
+                        "body": {
+                            "type": "box",
+                            "layout": "vertical",
+                            "contents": [
+                                {
+                                    "type": "text",
+                                    "text": f"✅ お住まいを「{stored_prefecture} {message}」に変更しました",
+                                    "wrap": True,
+                                    "weight": "bold",
+                                    "color": "#17C964"
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "住所が変わると、窓口情報や手続き内容が変わる可能性があります。タスクを再生成しますか？",
+                                    "wrap": True,
+                                    "margin": "lg",
+                                    "size": "sm"
+                                }
+                            ]
+                        },
+                        "footer": {
+                            "type": "box",
+                            "layout": "vertical",
+                            "contents": [
+                                {
+                                    "type": "button",
+                                    "action": {
+                                        "type": "postback",
+                                        "label": "タスクを再生成",
+                                        "data": "action=regenerate_tasks",
+                                        "displayText": "タスクを再生成"
+                                    },
+                                    "style": "primary",
+                                    "color": "#17C964"
+                                },
+                                {
+                                    "type": "button",
+                                    "action": {
+                                        "type": "message",
+                                        "label": "このまま",
+                                        "text": "設定"
+                                    },
+                                    "style": "link",
+                                    "margin": "sm"
+                                }
+                            ]
+                        }
+                    }
+                else:
+                    return "エラーが発生しました。もう一度お試しください。"
 
     # ヘルプと設定は常に表示可能
     if message == 'ヘルプ':
@@ -1219,6 +1370,285 @@ def handle_postback(event: PostbackEvent):
                 )
             )
 
+    elif action == 'edit_relationship':
+        # 故人との関係を変更
+        quick_reply = QuickReply(
+            items=[
+                QuickReplyItem(action=MessageAction(label="配偶者", text="配偶者")),
+                QuickReplyItem(action=MessageAction(label="子", text="子")),
+                QuickReplyItem(action=MessageAction(label="親", text="親")),
+                QuickReplyItem(action=MessageAction(label="兄弟姉妹", text="兄弟姉妹")),
+                QuickReplyItem(action=MessageAction(label="孫", text="孫")),
+                QuickReplyItem(action=MessageAction(label="その他", text="その他"))
+            ]
+        )
+
+        with engine.connect() as conn:
+            # editing_fieldフラグを設定
+            conn.execute(
+                sqlalchemy.text(
+                    """
+                    INSERT INTO conversation_history (user_id, role, message)
+                    VALUES (
+                        (SELECT id FROM users WHERE line_user_id = :line_user_id),
+                        'system',
+                        'editing:relationship'
+                    )
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            )
+            conn.commit()
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(
+                        text="故人との関係を選択してください",
+                        quick_reply=quick_reply
+                    )]
+                )
+            )
+
+    elif action == 'edit_address':
+        # お住まいを変更（都道府県選択）
+        quick_reply = QuickReply(
+            items=[
+                QuickReplyItem(action=MessageAction(label="東京都", text="東京都")),
+                QuickReplyItem(action=MessageAction(label="神奈川県", text="神奈川県")),
+                QuickReplyItem(action=MessageAction(label="大阪府", text="大阪府")),
+                QuickReplyItem(action=MessageAction(label="愛知県", text="愛知県")),
+                QuickReplyItem(action=MessageAction(label="埼玉県", text="埼玉県")),
+                QuickReplyItem(action=MessageAction(label="千葉県", text="千葉県")),
+                QuickReplyItem(action=MessageAction(label="兵庫県", text="兵庫県")),
+                QuickReplyItem(action=MessageAction(label="福岡県", text="福岡県")),
+                QuickReplyItem(action=MessageAction(label="北海道", text="北海道")),
+                QuickReplyItem(action=MessageAction(label="京都府", text="京都府")),
+                QuickReplyItem(action=MessageAction(label="その他", text="その他"))
+            ]
+        )
+
+        with engine.connect() as conn:
+            # editing_fieldフラグを設定（都道府県選択中）
+            conn.execute(
+                sqlalchemy.text(
+                    """
+                    INSERT INTO conversation_history (user_id, role, message)
+                    VALUES (
+                        (SELECT id FROM users WHERE line_user_id = :line_user_id),
+                        'system',
+                        'editing:prefecture'
+                    )
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            )
+            conn.commit()
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(
+                        text="お住まいの都道府県を選択してください",
+                        quick_reply=quick_reply
+                    )]
+                )
+            )
+
+    elif action == 'edit_death_date':
+        # 死亡日を変更
+        with engine.connect() as conn:
+            # editing_fieldフラグを設定
+            conn.execute(
+                sqlalchemy.text(
+                    """
+                    INSERT INTO conversation_history (user_id, role, message)
+                    VALUES (
+                        (SELECT id FROM users WHERE line_user_id = :line_user_id),
+                        'system',
+                        'editing:death_date'
+                    )
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            )
+            conn.commit()
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(
+                        text="死亡日を選択してください。\n\n下のボタンからカレンダーが開きます。",
+                        quick_reply=QuickReply(
+                            items=[
+                                QuickReplyItem(
+                                    action=DatetimePickerAction(
+                                        label="📅 日付を選択",
+                                        data="action=update_death_date",
+                                        mode="date"
+                                    )
+                                )
+                            ]
+                        )
+                    )]
+                )
+            )
+
+    elif action == 'update_death_date':
+        # Datetimepickerで選択された死亡日を更新
+        selected_date = event.postback.params.get('date')  # YYYY-MM-DD形式
+
+        with engine.connect() as conn:
+            user_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT u.id
+                    FROM users u
+                    WHERE u.line_user_id = :line_user_id
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            ).fetchone()
+
+            if not user_data:
+                reply_message = "ユーザー情報が見つかりません。"
+            else:
+                user_id = user_data[0]
+
+                # 死亡日を更新
+                from datetime import datetime as dt
+                death_dt = dt.fromisoformat(selected_date)
+
+                conn.execute(
+                    sqlalchemy.text(
+                        """
+                        UPDATE user_profiles
+                        SET death_date = :death_date
+                        WHERE user_id = :user_id
+                        """
+                    ),
+                    {"user_id": user_id, "death_date": death_dt}
+                )
+                conn.commit()
+
+                # タスク再生成確認
+                reply_message = {
+                    "type": "bubble",
+                    "body": {
+                        "type": "box",
+                        "layout": "vertical",
+                        "contents": [
+                            {
+                                "type": "text",
+                                "text": f"✅ 死亡日を{death_dt.strftime('%Y年%m月%d日')}に変更しました",
+                                "wrap": True,
+                                "weight": "bold",
+                                "color": "#17C964"
+                            },
+                            {
+                                "type": "text",
+                                "text": "タスクの期限を再計算しますか？",
+                                "wrap": True,
+                                "margin": "lg"
+                            }
+                        ]
+                    },
+                    "footer": {
+                        "type": "box",
+                        "layout": "vertical",
+                        "contents": [
+                            {
+                                "type": "button",
+                                "action": {
+                                    "type": "postback",
+                                    "label": "タスクを再生成",
+                                    "data": "action=regenerate_tasks",
+                                    "displayText": "タスクを再生成"
+                                },
+                                "style": "primary",
+                                "color": "#17C964"
+                            },
+                            {
+                                "type": "button",
+                                "action": {
+                                    "type": "message",
+                                    "label": "このまま",
+                                    "text": "設定"
+                                },
+                                "style": "link",
+                                "margin": "sm"
+                            }
+                        ]
+                    }
+                }
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            if isinstance(reply_message, dict):
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[FlexMessage(alt_text="死亡日変更完了", contents=FlexContainer.from_dict(reply_message))]
+                    )
+                )
+            else:
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_message)]
+                    )
+                )
+
+    elif action == 'regenerate_tasks':
+        # 既存タスクを削除してタスクを再生成
+        with engine.connect() as conn:
+            user_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT u.id
+                    FROM users u
+                    WHERE u.line_user_id = :line_user_id
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            ).fetchone()
+
+            if user_data:
+                user_id = user_data[0]
+
+                # 既存タスクを削除
+                conn.execute(
+                    sqlalchemy.text("DELETE FROM tasks WHERE user_id = :user_id"),
+                    {"user_id": user_id}
+                )
+                conn.commit()
+
+                # タスク再生成をCloud Tasksに投入
+                enqueue_task_generation(user_id, line_user_id)
+
+                reply_message = """✅ タスクを再生成しています
+
+🤖 AIがあなた専用のタスクを生成中です...
+
+⏱️ 生成には5分程度かかります。完了したら通知でお知らせします。"""
+            else:
+                reply_message = "ユーザー情報が見つかりません。"
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_message)]
+                )
+            )
+
     else:
         # 未知のアクション
         with ApiClient(configuration) as api_client:
@@ -1255,7 +1685,7 @@ def get_help_message() -> str:
    - ヘルプ：このメッセージ
 
 📞 **お問い合わせ**
-k.shimada1115@gmail.com
+ko_15_ko_15-m1@yahoo.co.jp
 
 💡 **ヒント**
 - 「タスク」でタスク一覧を表示
@@ -1263,16 +1693,161 @@ k.shimada1115@gmail.com
 - 質問は自由に入力してください"""
 
 
-def get_settings_message(user_id: str, relationship: str, prefecture: str, municipality: str, death_date) -> str:
-    """設定メッセージを生成"""
+def get_settings_message(user_id: str, relationship: str, prefecture: str, municipality: str, death_date):
+    """設定メッセージを生成（FlexMessage形式）"""
     # 死亡日をフォーマット
     death_date_str = death_date.strftime("%Y年%m月%d日") if death_date else "未設定"
 
-    return f"""【現在の設定】
-
-👤 **故人との関係**: {relationship or '未設定'}
-📍 **お住まい**: {prefecture or '未設定'} {municipality or ''}
-📅 **死亡日**: {death_date_str}
-
-💡 プロフィール情報を変更したい場合は、お手数ですが管理者までお問い合わせください。
-📧 k.shimada1115@gmail.com"""
+    return {
+        "type": "bubble",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": "⚙️ 設定",
+                    "weight": "bold",
+                    "size": "lg",
+                    "color": "#333333"
+                }
+            ],
+            "paddingAll": "15px",
+            "backgroundColor": "#F7F7F7"
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                # 故人との関係
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": "👤 故人との関係",
+                            "size": "sm",
+                            "color": "#999999",
+                            "weight": "bold"
+                        },
+                        {
+                            "type": "text",
+                            "text": relationship or "未設定",
+                            "size": "md",
+                            "color": "#333333",
+                            "wrap": True,
+                            "margin": "sm"
+                        },
+                        {
+                            "type": "button",
+                            "action": {
+                                "type": "postback",
+                                "label": "変更",
+                                "data": "action=edit_relationship",
+                                "displayText": "故人との関係を変更"
+                            },
+                            "style": "link",
+                            "height": "sm",
+                            "margin": "sm"
+                        }
+                    ],
+                    "paddingAll": "12px",
+                    "backgroundColor": "#FAFAFA",
+                    "cornerRadius": "8px"
+                },
+                # お住まい
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": "📍 お住まい",
+                            "size": "sm",
+                            "color": "#999999",
+                            "weight": "bold"
+                        },
+                        {
+                            "type": "text",
+                            "text": f"{prefecture or '未設定'} {municipality or ''}",
+                            "size": "md",
+                            "color": "#333333",
+                            "wrap": True,
+                            "margin": "sm"
+                        },
+                        {
+                            "type": "button",
+                            "action": {
+                                "type": "postback",
+                                "label": "変更",
+                                "data": "action=edit_address",
+                                "displayText": "お住まいを変更"
+                            },
+                            "style": "link",
+                            "height": "sm",
+                            "margin": "sm"
+                        }
+                    ],
+                    "paddingAll": "12px",
+                    "backgroundColor": "#FAFAFA",
+                    "cornerRadius": "8px",
+                    "margin": "md"
+                },
+                # 死亡日
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": "📅 死亡日",
+                            "size": "sm",
+                            "color": "#999999",
+                            "weight": "bold"
+                        },
+                        {
+                            "type": "text",
+                            "text": death_date_str,
+                            "size": "md",
+                            "color": "#333333",
+                            "wrap": True,
+                            "margin": "sm"
+                        },
+                        {
+                            "type": "button",
+                            "action": {
+                                "type": "postback",
+                                "label": "変更",
+                                "data": "action=edit_death_date",
+                                "displayText": "死亡日を変更"
+                            },
+                            "style": "link",
+                            "height": "sm",
+                            "margin": "sm"
+                        }
+                    ],
+                    "paddingAll": "12px",
+                    "backgroundColor": "#FAFAFA",
+                    "cornerRadius": "8px",
+                    "margin": "md"
+                },
+                # 注意書き
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": "💡 死亡日を変更すると、タスクの期限も再計算されます。",
+                            "size": "xs",
+                            "color": "#999999",
+                            "wrap": True
+                        }
+                    ],
+                    "margin": "lg"
+                }
+            ],
+            "paddingAll": "20px"
+        }
+    }
