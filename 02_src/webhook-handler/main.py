@@ -255,6 +255,93 @@ def enqueue_tips_enhancement(user_id: str, line_user_id: str):
     print(f"📤 Tips収集ジョブを投入: {response.name}")
 
 
+def enqueue_ai_response_generation(user_id: str, line_user_id: str, user_message: str):
+    """Cloud TasksにAI応答生成ジョブを投入"""
+    client = tasks_v2.CloudTasksClient()
+    # TODO: AI応答用に別のキュー(ai-response-queue)を立てることを推奨
+    queue_name = 'task-generation-queue'
+    parent = client.queue_path(PROJECT_ID, REGION, queue_name)
+
+    worker_url = f"https://{REGION}-{PROJECT_ID}.cloudfunctions.net/ai_response_worker"
+
+    payload = json.dumps({
+        'user_id': str(user_id),
+        'line_user_id': line_user_id,
+        'user_message': user_message
+    }).encode()
+
+    task = {
+        'http_request': {
+            'http_method': tasks_v2.HttpMethod.POST,
+            'url': worker_url,
+            'headers': {'Content-Type': 'application/json'},
+            'body': payload,
+            'oidc_token': {
+                'service_account_email': 'webhook-handler@uketsuguai-dev.iam.gserviceaccount.com'
+            }
+        }
+    }
+
+    response = client.create_task(request={'parent': parent, 'task': task})
+    print(f"📤 AI応答生成ジョブを投入: {response.name}")
+
+
+@functions_framework.http
+def ai_response_worker(request: Request):
+    """非同期AI応答生成ワーカー"""
+    try:
+        request_json = request.get_json(silent=True)
+        if not request_json:
+            return jsonify({"error": "Invalid request body"}), 400
+
+        user_id = request_json.get('user_id')
+        line_user_id = request_json.get('line_user_id')
+        user_message = request_json.get('user_message')
+
+        if not all([user_id, line_user_id, user_message]):
+            return jsonify({"error": "user_id, line_user_id, and user_message are required"}), 400
+
+        print(f"🔄 AI応答生成開始: user_id={user_id}")
+
+        # AI応答を生成
+        ai_reply = generate_ai_response(user_id, user_message)
+
+        # LINE Push API で通知
+        configuration = get_configuration()
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.push_message(
+                PushMessageRequest(
+                    to=line_user_id,
+                    messages=[TextMessage(text=ai_reply)]
+                )
+            )
+
+        print(f"📤 AI応答Push通知送信完了: line_user_id={line_user_id}")
+        return jsonify({"status": "success"}), 200
+
+    except Exception as e:
+        print(f"❌ AI応答生成エラー: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            if 'line_user_id' in locals() and line_user_id:
+                configuration = get_configuration()
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.push_message(
+                        PushMessageRequest(
+                            to=line_user_id,
+                            messages=[TextMessage(
+                                text="申し訳ございません。AIの応答生成中にエラーが発生しました。"
+                            )]
+                        )
+                    )
+        except:
+            pass
+        return jsonify({"error": str(e)}), 500
+
+
 @functions_framework.http
 def generate_tasks_worker(request: Request):
     """
@@ -1073,7 +1160,9 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
                     # 「完了1」「1完了」「完了１」「１完了」などのパターンをチェック
                     return complete_task(user_id, message)
                 else:
-                    return generate_ai_response(user_id, message)
+                    # AI応答生成を非同期化
+                    enqueue_ai_response_generation(user_id, line_user_id, message)
+                    return "🤖 AIが応答を考えています... しばらくお待ちください。"
             else:
                 # タスク生成をCloud Tasksに投入（非同期）
                 enqueue_task_generation(user_id, line_user_id)
