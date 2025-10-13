@@ -36,6 +36,17 @@ from google import genai
 from google.genai import types
 from flex_messages import create_task_list_flex, create_task_completed_flex
 from knowledge_base import search_knowledge
+from question_generator import (
+    generate_follow_up_questions,
+    get_unanswered_questions,
+    save_answer,
+    check_all_questions_answered,
+    get_user_answers,
+    format_question_for_line
+)
+from conversation_flow_manager import ConversationFlowManager, ConversationState
+from task_personalizer import generate_personalized_tasks
+from task_enhancer import enhance_tasks_with_tips, generate_general_tips_task
 
 # 環境変数からGCP設定を取得
 PROJECT_ID = os.environ.get('GCP_PROJECT_ID')
@@ -186,12 +197,71 @@ def enqueue_task_generation(user_id: str, line_user_id: str):
     print(f"📤 Cloud Taskを投入しました: {response.name}")
 
 
+def enqueue_personalized_task_generation(user_id: str, line_user_id: str):
+    """Cloud Tasksに個別タスク生成ジョブを投入"""
+    client = tasks_v2.CloudTasksClient()
+    queue_name = 'task-generation-queue'
+    parent = client.queue_path(PROJECT_ID, REGION, queue_name)
+
+    worker_url = f"https://{REGION}-{PROJECT_ID}.cloudfunctions.net/personalized-tasks-worker"
+
+    payload = json.dumps({
+        'user_id': str(user_id),
+        'line_user_id': line_user_id
+    }).encode()
+
+    task = {
+        'http_request': {
+            'http_method': tasks_v2.HttpMethod.POST,
+            'url': worker_url,
+            'headers': {'Content-Type': 'application/json'},
+            'body': payload,
+            'oidc_token': {
+                'service_account_email': 'webhook-handler@uketsuguai-dev.iam.gserviceaccount.com'
+            }
+        }
+    }
+
+    response = client.create_task(request={'parent': parent, 'task': task})
+    print(f"📤 個別タスク生成ジョブを投入: {response.name}")
+
+
+def enqueue_tips_enhancement(user_id: str, line_user_id: str):
+    """Cloud TasksにTips収集ジョブを投入"""
+    client = tasks_v2.CloudTasksClient()
+    queue_name = 'task-generation-queue'
+    parent = client.queue_path(PROJECT_ID, REGION, queue_name)
+
+    worker_url = f"https://{REGION}-{PROJECT_ID}.cloudfunctions.net/tips-enhancement-worker"
+
+    payload = json.dumps({
+        'user_id': str(user_id),
+        'line_user_id': line_user_id
+    }).encode()
+
+    task = {
+        'http_request': {
+            'http_method': tasks_v2.HttpMethod.POST,
+            'url': worker_url,
+            'headers': {'Content-Type': 'application/json'},
+            'body': payload,
+            'oidc_token': {
+                'service_account_email': 'webhook-handler@uketsuguai-dev.iam.gserviceaccount.com'
+            }
+        }
+    }
+
+    response = client.create_task(request={'parent': parent, 'task': task})
+    print(f"📤 Tips収集ジョブを投入: {response.name}")
+
+
 @functions_framework.http
 def generate_tasks_worker(request: Request):
     """
-    非同期タスク生成ワーカー
+    非同期タスク生成ワーカー（Step 1: 基本タスク）
 
-    Cloud Tasksから呼び出され、タスクを生成してPush通知する
+    Cloud Tasksから呼び出され、基本タスクを生成してPush通知する
+    完了後、追加質問を生成してユーザーに送信
     """
     from task_generator import generate_basic_tasks, get_task_summary_message
 
@@ -209,10 +279,15 @@ def generate_tasks_worker(request: Request):
         if not line_user_id:
             return jsonify({"error": "line_user_id is required"}), 400
 
-        print(f"🔄 タスク生成開始: user_id={user_id}, line_user_id={line_user_id}")
+        print(f"🔄 Step 1: 基本タスク生成開始: user_id={user_id}")
 
         # データベース接続
         engine = get_db_engine()
+
+        # 会話フロー管理初期化
+        with engine.connect() as conn:
+            flow_manager = ConversationFlowManager(conn)
+            flow_manager.set_task_generation_step_status(user_id, 'basic', 'in_progress')
 
         # ユーザープロフィールを取得
         with engine.connect() as conn:
@@ -238,40 +313,113 @@ def generate_tasks_worker(request: Request):
                 'death_date': profile_data[3]
             }
 
-        # タスク生成（この処理に5分程度かかる）
-        print(f"🔍 AI駆動型タスク生成中...")
-        tasks = generate_basic_tasks(user_id, profile, engine.connect())
+        # Step 1: 基本タスク生成
+        with engine.connect() as conn:
+            tasks = generate_basic_tasks(user_id, profile, conn)
 
-        print(f"✅ タスク生成完了: {len(tasks)}件")
+        print(f"✅ Step 1完了: {len(tasks)}件の基本タスクを生成")
 
-        # サマリーメッセージを作成
+        # Step 1完了をマーク
+        with engine.connect() as conn:
+            flow_manager = ConversationFlowManager(conn)
+            flow_manager.set_task_generation_step_status(
+                user_id, 'basic', 'completed',
+                metadata={'task_count': len(tasks)}
+            )
+
+        # 追加質問を生成
+        with engine.connect() as conn:
+            questions = generate_follow_up_questions(user_id, profile, tasks, conn)
+
+        print(f"✅ 追加質問生成完了: {len(questions)}件")
+
+        # サマリーメッセージ + 追加質問
         municipality = profile['municipality']
         summary_message = get_task_summary_message(tasks, municipality)
 
-        # LINE Push APIで通知
+        # 追加質問の最初の質問を取得
+        with engine.connect() as conn:
+            first_question_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT question_text, question_type, options
+                    FROM follow_up_questions
+                    WHERE user_id = :user_id AND is_answered = false
+                    ORDER BY display_order
+                    LIMIT 1
+                    """
+                ),
+                {'user_id': user_id}
+            ).fetchone()
+
+        # LINE Push API で通知
         configuration = get_configuration()
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
 
+            messages = [TextMessage(text=summary_message)]
+
+            if first_question_data:
+                question_obj = {
+                    'question_text': first_question_data[0],
+                    'question_type': first_question_data[1],
+                    'options': first_question_data[2]
+                }
+                question_message = format_question_for_line(question_obj)
+
+                # Quick Replyで質問
+                quick_reply = QuickReply(
+                    items=[
+                        QuickReplyItem(action=MessageAction(label="はい", text="はい")),
+                        QuickReplyItem(action=MessageAction(label="いいえ", text="いいえ"))
+                    ]
+                )
+
+                messages.append(
+                    TextMessage(
+                        text=f"\n\n📝 より詳細なタスクを生成するため、いくつか質問させてください。\n\n{question_message}",
+                        quick_reply=quick_reply
+                    )
+                )
+
             line_bot_api.push_message(
                 PushMessageRequest(
                     to=line_user_id,
-                    messages=[TextMessage(text=summary_message)]
+                    messages=messages
                 )
             )
 
         print(f"📤 Push通知送信完了: line_user_id={line_user_id}")
 
+        # 会話状態を「追加質問待ち」に設定
+        with engine.connect() as conn:
+            flow_manager = ConversationFlowManager(conn)
+            flow_manager.set_state(
+                user_id,
+                'awaiting_follow_up_answers',
+                {'current_question_index': 0}
+            )
+
         return jsonify({
             "status": "success",
             "user_id": user_id,
-            "tasks_count": len(tasks)
+            "basic_tasks_count": len(tasks),
+            "follow_up_questions_count": len(questions)
         }), 200
 
     except Exception as e:
         print(f"❌ タスク生成エラー: {e}")
         import traceback
         traceback.print_exc()
+
+        # エラー時はStep 1をfailedにマーク
+        if 'user_id' in locals():
+            with engine.connect() as conn:
+                flow_manager = ConversationFlowManager(conn)
+                flow_manager.set_task_generation_step_status(
+                    user_id, 'basic', 'failed',
+                    error_message=str(e)
+                )
 
         # エラー時もユーザーに通知
         try:
@@ -533,6 +681,55 @@ def handle_message(event: MessageEvent):
 def process_profile_collection(user_id, line_user_id, message, relationship, prefecture, municipality, death_date):
     """プロフィール収集処理"""
     engine = get_db_engine()
+
+    # 追加質問回答待ち状態のチェック
+    with engine.connect() as conn:
+        flow_manager = ConversationFlowManager(conn)
+        current_state = flow_manager.get_current_state(user_id)
+
+        # 追加質問回答待ち状態の場合
+        if current_state == 'awaiting_follow_up_answers':
+            # 未回答の質問を取得
+            questions = get_unanswered_questions(user_id, conn)
+
+            if questions:
+                # 最初の未回答質問に対する回答として保存
+                first_question = questions[0]
+                save_answer(user_id, first_question['question_key'], message, conn)
+
+                # まだ未回答の質問があるか確認
+                remaining_questions = get_unanswered_questions(user_id, conn)
+
+                if remaining_questions:
+                    # 次の質問を送信
+                    next_question = remaining_questions[0]
+                    question_message = format_question_for_line(next_question)
+
+                    quick_reply = QuickReply(
+                        items=[
+                            QuickReplyItem(action=MessageAction(label="はい", text="はい")),
+                            QuickReplyItem(action=MessageAction(label="いいえ", text="いいえ"))
+                        ]
+                    )
+
+                    return {
+                        "type": "text_with_quick_reply",
+                        "text": question_message,
+                        "quick_reply": quick_reply
+                    }
+                else:
+                    # すべての質問に回答完了
+                    # Step 2: 個別タスク生成を開始
+                    flow_manager.clear_state(user_id, 'awaiting_follow_up_answers')
+
+                    # Cloud Tasksに個別タスク生成ジョブを投入
+                    enqueue_personalized_task_generation(user_id, line_user_id)
+
+                    return """✅ 質問へのご回答ありがとうございました！
+
+🤖 あなたの状況に特化した追加タスクを生成中です...
+
+⏱️ 完了したら通知でお知らせします。"""
 
     # 編集モードのチェック
     with engine.connect() as conn:
@@ -1989,6 +2186,205 @@ def handle_postback(event: PostbackEvent):
                     messages=[TextMessage(text=f"不明なアクション: {action}")]
                 )
             )
+
+
+@functions_framework.http
+def personalized_tasks_worker(request: Request):
+    """
+    Step 2: 個別タスク生成ワーカー
+
+    Cloud Tasksから呼び出され、追加質問の回答に基づいて
+    個別タスクを生成する
+    """
+    try:
+        request_json = request.get_json(silent=True)
+        if not request_json:
+            return jsonify({"error": "Invalid request body"}), 400
+
+        user_id = request_json.get('user_id')
+        line_user_id = request_json.get('line_user_id')
+
+        if not user_id or not line_user_id:
+            return jsonify({"error": "user_id and line_user_id are required"}), 400
+
+        print(f"🔄 Step 2: 個別タスク生成開始: user_id={user_id}")
+
+        engine = get_db_engine()
+
+        # Step 2開始をマーク
+        with engine.connect() as conn:
+            flow_manager = ConversationFlowManager(conn)
+            flow_manager.set_task_generation_step_status(user_id, 'personalized', 'in_progress')
+
+        # プロフィールと追加回答を取得
+        with engine.connect() as conn:
+            profile_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT relationship, prefecture, municipality, death_date
+                    FROM user_profiles
+                    WHERE user_id = :user_id
+                    """
+                ),
+                {"user_id": user_id}
+            ).fetchone()
+
+            profile = {
+                'relationship': profile_data[0],
+                'prefecture': profile_data[1],
+                'municipality': profile_data[2],
+                'death_date': profile_data[3]
+            }
+
+            additional_answers = get_user_answers(user_id, conn)
+
+        # Step 2: 個別タスク生成
+        with engine.connect() as conn:
+            personalized_tasks = generate_personalized_tasks(
+                user_id, profile, additional_answers, conn
+            )
+
+        print(f"✅ Step 2完了: {len(personalized_tasks)}件の個別タスクを生成")
+
+        # Step 2完了をマーク
+        with engine.connect() as conn:
+            flow_manager = ConversationFlowManager(conn)
+            flow_manager.set_task_generation_step_status(
+                user_id, 'personalized', 'completed',
+                metadata={'task_count': len(personalized_tasks)}
+            )
+
+        # LINE通知
+        configuration = get_configuration()
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.push_message(
+                PushMessageRequest(
+                    to=line_user_id,
+                    messages=[TextMessage(
+                        text=f"✅ あなた専用の追加タスクを{len(personalized_tasks)}件生成しました！\n\n「タスク」と送信して確認してください。"
+                    )]
+                )
+            )
+
+        # Step 3: Tips収集をバックグラウンドで開始
+        enqueue_tips_enhancement(user_id, line_user_id)
+
+        return jsonify({
+            "status": "success",
+            "user_id": user_id,
+            "personalized_tasks_count": len(personalized_tasks)
+        }), 200
+
+    except Exception as e:
+        print(f"❌ 個別タスク生成エラー: {e}")
+        import traceback
+        traceback.print_exc()
+
+        if 'user_id' in locals():
+            with engine.connect() as conn:
+                flow_manager = ConversationFlowManager(conn)
+                flow_manager.set_task_generation_step_status(
+                    user_id, 'personalized', 'failed',
+                    error_message=str(e)
+                )
+
+        return jsonify({"error": str(e)}), 500
+
+
+@functions_framework.http
+def tips_enhancement_worker(request: Request):
+    """
+    Step 3: Tips収集・拡張ワーカー
+
+    Cloud Tasksから呼び出され、既存タスクにSNS・ブログから
+    収集したTipsを追加する
+    """
+    try:
+        request_json = request.get_json(silent=True)
+        if not request_json:
+            return jsonify({"error": "Invalid request body"}), 400
+
+        user_id = request_json.get('user_id')
+        line_user_id = request_json.get('line_user_id')
+
+        if not user_id or not line_user_id:
+            return jsonify({"error": "user_id and line_user_id are required"}), 400
+
+        print(f"🔄 Step 3: Tips収集開始: user_id={user_id}")
+
+        engine = get_db_engine()
+
+        # Step 3開始をマーク
+        with engine.connect() as conn:
+            flow_manager = ConversationFlowManager(conn)
+            flow_manager.set_task_generation_step_status(user_id, 'enhanced', 'in_progress')
+
+        # プロフィール取得
+        with engine.connect() as conn:
+            profile_data = conn.execute(
+                sqlalchemy.text(
+                    "SELECT relationship, prefecture, municipality, death_date FROM user_profiles WHERE user_id = :user_id"
+                ),
+                {"user_id": user_id}
+            ).fetchone()
+
+            profile = {
+                'relationship': profile_data[0],
+                'prefecture': profile_data[1],
+                'municipality': profile_data[2],
+                'death_date': profile_data[3]
+            }
+
+        # Step 3: Tips収集・拡張
+        with engine.connect() as conn:
+            stats = enhance_tasks_with_tips(user_id, conn)
+            generate_general_tips_task(user_id, profile, conn)
+
+        print(f"✅ Step 3完了: {stats['enhanced_count']}件のタスクに{stats['new_tips_count']}個のTipsを追加")
+
+        # Step 3完了をマーク
+        with engine.connect() as conn:
+            flow_manager = ConversationFlowManager(conn)
+            flow_manager.set_task_generation_step_status(
+                user_id, 'enhanced', 'completed',
+                metadata=stats
+            )
+
+        # LINE通知
+        configuration = get_configuration()
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.push_message(
+                PushMessageRequest(
+                    to=line_user_id,
+                    messages=[TextMessage(
+                        text=f"💡 タスクに実用的なTipsを追加しました！\n\n体験談や裏技を参考にして、スムーズに手続きを進めてください。"
+                    )]
+                )
+            )
+
+        return jsonify({
+            "status": "success",
+            "user_id": user_id,
+            "enhanced_count": stats['enhanced_count'],
+            "new_tips_count": stats['new_tips_count']
+        }), 200
+
+    except Exception as e:
+        print(f"❌ Tips収集エラー: {e}")
+        import traceback
+        traceback.print_exc()
+
+        if 'user_id' in locals():
+            with engine.connect() as conn:
+                flow_manager = ConversationFlowManager(conn)
+                flow_manager.set_task_generation_step_status(
+                    user_id, 'enhanced', 'failed',
+                    error_message=str(e)
+                )
+
+        return jsonify({"error": str(e)}), 500
 
 
 def get_help_message() -> str:
