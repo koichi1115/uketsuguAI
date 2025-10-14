@@ -168,17 +168,25 @@ class SubscriptionManager:
         Args:
             session: Stripe Checkout Sessionオブジェクト
         """
+        print(f"🔍 handle_checkout_completed開始: session={session}")
+
         user_id = session["metadata"]["user_id"]
         customer_id = session["customer"]
         subscription_id = session["subscription"]
 
-        # サブスクリプション情報を取得
-        subscription = stripe.Subscription.retrieve(subscription_id)
+        print(f"📝 ユーザー情報: user_id={user_id}, customer_id={customer_id}, subscription_id={subscription_id}")
 
+        # サブスクリプション情報を取得
+        print(f"🔄 Stripeからサブスクリプション情報を取得中...")
+        subscription = stripe.Subscription.retrieve(subscription_id)
+        print(f"✅ サブスクリプション取得完了: current_period_start={subscription['current_period_start']}")
+
+        print(f"🗄️ データベース接続開始...")
         with self.engine.connect() as conn:
             with conn.begin():
+                print(f"🔄 既存サブスクリプションを無効化中...")
                 # 既存のサブスクリプションを無効化
-                conn.execute(
+                result = conn.execute(
                     text("""
                         UPDATE subscriptions
                         SET status = :expired_status,
@@ -192,9 +200,11 @@ class SubscriptionManager:
                         "expired_status": self.STATUS_EXPIRED
                     }
                 )
+                print(f"✅ 既存サブスクリプション無効化完了: 更新件数={result.rowcount}")
 
+                print(f"🆕 新しいサブスクリプションを作成中...")
                 # 新しいサブスクリプションを作成
-                conn.execute(
+                result = conn.execute(
                     text("""
                         INSERT INTO subscriptions (
                             user_id, plan_type, status, start_date,
@@ -216,6 +226,9 @@ class SubscriptionManager:
                         "subscription_id": subscription_id
                     }
                 )
+                print(f"✅ サブスクリプション作成完了")
+
+        print(f"🎉 handle_checkout_completed処理完了！")
 
     def handle_subscription_deleted(self, subscription: Dict[str, Any]) -> None:
         """

@@ -167,7 +167,7 @@ def get_subscription_manager():
 
     if _subscription_manager is None:
         engine = get_db_engine()
-        stripe_api_key = get_secret('STRIPE_API_KEY')
+        stripe_api_key = get_secret('STRIPE_API_KEY').strip()
         _subscription_manager = SubscriptionManager(engine, stripe_api_key)
 
     return _subscription_manager
@@ -1161,6 +1161,8 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
         return get_help_message()
     elif message == '設定':
         return get_settings_message(user_id, relationship, prefecture, municipality, death_date)
+    elif message in ['アップグレード', '有料プラン', '課金', 'プラン変更']:
+        return handle_upgrade_request(user_id, line_user_id)
 
     # プロフィールが全て揃っている場合
     if relationship and prefecture and municipality and death_date:
@@ -2591,6 +2593,135 @@ def tips_enhancement_worker(request: Request):
         return jsonify({"error": str(e)}), 500
 
 
+@functions_framework.http
+def stripe_webhook(request: Request):
+    """
+    Stripe Webhookエンドポイント
+
+    決済完了やサブスクリプションキャンセルなどのイベントを受け取る
+    """
+    try:
+        # Stripe署名検証用のシークレットを取得
+        webhook_secret = get_secret('STRIPE_WEBHOOK_SECRET').strip()
+
+        # リクエストボディと署名を取得
+        payload = request.get_data(as_text=True)
+        sig_header = request.headers.get('Stripe-Signature')
+
+        if not sig_header:
+            print("❌ Stripe署名ヘッダーがありません")
+            return jsonify({"error": "No signature header"}), 400
+
+        # Stripe署名を検証してイベントを構築
+        import stripe
+        try:
+            event = stripe.Webhook.construct_event(
+                payload, sig_header, webhook_secret
+            )
+        except stripe.error.SignatureVerificationError as e:
+            print(f"❌ Stripe署名検証エラー: {str(e)}")
+            return jsonify({"error": "Invalid signature"}), 400
+
+        # イベントタイプに応じて処理
+        event_type = event['type']
+        print(f"📬 Stripe Webhookイベント受信: {event_type}")
+
+        subscription_manager = get_subscription_manager()
+
+        if event_type == 'checkout.session.completed':
+            # 決済完了イベント
+            session = event['data']['object']
+            subscription_manager.handle_checkout_completed(session)
+            print(f"✅ Checkout完了処理: user_id={session['metadata'].get('user_id')}")
+
+        elif event_type == 'customer.subscription.deleted':
+            # サブスクリプションキャンセルイベント
+            subscription = event['data']['object']
+            subscription_manager.handle_subscription_deleted(subscription)
+            print(f"✅ サブスクリプション削除処理: subscription_id={subscription['id']}")
+
+        else:
+            # その他のイベントはログのみ
+            print(f"ℹ️ 未処理のイベントタイプ: {event_type}")
+
+        return jsonify({"status": "success"}), 200
+
+    except Exception as e:
+        print(f"❌ Stripe Webhookエラー: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+def handle_upgrade_request(user_id: str, line_user_id: str):
+    """アップグレードリクエストを処理"""
+    engine = get_db_engine()
+    subscription_manager = get_subscription_manager()
+    plan_controller = get_plan_controller()
+
+    # 現在のプラン状態を確認
+    if subscription_manager.is_premium_user(str(user_id)):
+        # 既に有料プランの場合
+        subscription = subscription_manager.get_user_subscription(str(user_id))
+        return f"""✅ 有料プラン加入中です
+
+現在のプラン: β版プラン（月額500円）
+ステータス: {subscription['status']}
+
+有料プランの特典：
+✅ すべてのタスクを閲覧
+✅ 独自タスクの追加・編集・削除
+✅ リマインダー機能（準備中）
+✅ グループLINE対応（準備中）
+
+プランの管理は「設定」から行えます。"""
+
+    # 無料プランの場合、Stripe Checkoutセッションを作成
+    try:
+        # 決済完了後のリダイレクトURL
+        # Stripeの制約でhttps://が必要なため、一時的にダミーのURLを使用
+        # 実際の本番環境では、専用のランディングページを用意するのが望ましい
+        import urllib.parse
+        base_url = "https://line.me/R/oaMessage/@yourbotid/"
+        success_message = urllib.parse.quote("感謝します！有料プラン登録が完了しました")
+        cancel_message = urllib.parse.quote("キャンセルされました")
+
+        success_url = f"{base_url}?{success_message}"
+        cancel_url = f"{base_url}?{cancel_message}"
+
+        checkout_url = subscription_manager.create_checkout_session(
+            user_id=str(user_id),
+            line_user_id=line_user_id,
+            success_url=success_url,
+            cancel_url=cancel_url
+        )
+
+        return f"""💎 有料プランへのアップグレード
+
+β版プラン: 月額500円（税込）
+
+【特典】
+✅ すべてのタスクを閲覧
+✅ 独自タスクの追加・編集・削除
+✅ リマインダー機能（準備中）
+✅ グループLINE対応（準備中）
+
+以下のリンクから決済画面にアクセスしてください：
+{checkout_url}
+
+※クレジットカード決済（Stripe）を利用します
+※テスト環境では実際の決済は行われません"""
+
+    except Exception as e:
+        print(f"Stripe Checkoutセッション作成エラー: {str(e)}")
+        return """申し訳ございません。現在アップグレード処理に問題が発生しています。
+
+しばらく経ってから再度お試しください。
+問題が続く場合は、お問い合わせください。
+
+📞 お問い合わせ: ko_15_ko_15-m1@yahoo.co.jp"""
+
+
 def get_help_message() -> str:
     """ヘルプメッセージを生成"""
     return """【受け継ぐAI 使い方ガイド】
@@ -2621,6 +2752,74 @@ ko_15_ko_15-m1@yahoo.co.jp
 - 「タスク」でタスク一覧を表示
 - 「全タスク」で完了済み含む全て表示
 - 質問は自由に入力してください"""
+
+
+def get_plan_info_section(user_id: str):
+    """プラン情報セクションを生成"""
+    subscription_manager = get_subscription_manager()
+    plan_controller = get_plan_controller()
+
+    is_premium = subscription_manager.is_premium_user(str(user_id))
+
+    if is_premium:
+        # 有料プランの場合
+        subscription = subscription_manager.get_user_subscription(str(user_id))
+        plan_text = "β版プラン（月額500円）"
+        status_text = "✅ アクティブ"
+        button_label = "プラン管理"
+        button_text = "プラン変更"
+    else:
+        # 無料プランの場合
+        plan_text = "無料プラン"
+        status_text = "⚠️ 2タスクまで閲覧可能"
+        button_label = "アップグレード"
+        button_text = "アップグレード"
+
+    return {
+        "type": "box",
+        "layout": "vertical",
+        "contents": [
+            {
+                "type": "text",
+                "text": "💎 プラン",
+                "size": "sm",
+                "color": "#999999",
+                "weight": "bold"
+            },
+            {
+                "type": "text",
+                "text": plan_text,
+                "size": "md",
+                "color": "#333333",
+                "wrap": True,
+                "margin": "sm"
+            },
+            {
+                "type": "text",
+                "text": status_text,
+                "size": "xs",
+                "color": "#17C964" if is_premium else "#F5A623",
+                "wrap": True,
+                "margin": "xs"
+            },
+            {
+                "type": "button",
+                "action": {
+                    "type": "message",
+                    "label": button_label,
+                    "text": button_text
+                },
+                "style": "primary" if not is_premium else "link",
+                "color": "#17C964" if not is_premium else None,
+                "height": "sm",
+                "margin": "md"
+            }
+        ],
+        "paddingAll": "12px",
+        "backgroundColor": "#FAFAFA",
+        "cornerRadius": "8px",
+        "margin": "md"
+    }
 
 
 def get_settings_message(user_id: str, relationship: str, prefecture: str, municipality: str, death_date):
@@ -2762,6 +2961,8 @@ def get_settings_message(user_id: str, relationship: str, prefecture: str, munic
                     "cornerRadius": "8px",
                     "margin": "md"
                 },
+                # プラン情報を追加
+                get_plan_info_section(user_id),
                 # 注意書き
                 {
                     "type": "box",
