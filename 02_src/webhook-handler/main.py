@@ -47,6 +47,9 @@ from question_generator import (
 from conversation_flow_manager import ConversationFlowManager, ConversationState
 from task_personalizer import generate_personalized_tasks
 from task_enhancer import enhance_tasks_with_tips, generate_general_tips_task
+from rate_limiter import is_rate_limited
+from subscription_manager import SubscriptionManager
+from plan_controller import PlanController
 
 # 環境変数からGCP設定を取得
 PROJECT_ID = os.environ.get('GCP_PROJECT_ID')
@@ -58,6 +61,8 @@ _configuration = None
 _engine = None
 _connector = None
 _gemini_client = None
+_subscription_manager = None
+_plan_controller = None
 
 
 def get_secret(secret_id: str) -> str:
@@ -154,6 +159,29 @@ def get_gemini_client():
         _gemini_client = genai.Client(api_key=gemini_api_key)
 
     return _gemini_client
+
+
+def get_subscription_manager():
+    """Subscription Managerを取得（遅延初期化）"""
+    global _subscription_manager
+
+    if _subscription_manager is None:
+        engine = get_db_engine()
+        stripe_api_key = get_secret('STRIPE_API_KEY')
+        _subscription_manager = SubscriptionManager(engine, stripe_api_key)
+
+    return _subscription_manager
+
+
+def get_plan_controller():
+    """Plan Controllerを取得（遅延初期化）"""
+    global _plan_controller
+
+    if _plan_controller is None:
+        subscription_manager = get_subscription_manager()
+        _plan_controller = PlanController(subscription_manager)
+
+    return _plan_controller
 
 
 def enqueue_task_generation(user_id: str, line_user_id: str):
@@ -673,6 +701,19 @@ def handle_message(event: MessageEvent):
         ).fetchone()
 
     user_id = user_data[0]
+
+    # ⭐ Phase 1: レート制限チェック
+    is_limited, limit_message = is_rate_limited(str(user_id), engine)
+    if is_limited:
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=limit_message)]
+                )
+            )
+        return  # レート制限超過のため処理終了
     relationship = user_data[1]
     prefecture = user_data[2]
     municipality = user_data[3]
@@ -1348,8 +1389,24 @@ def get_task_list_message(user_id: str, show_all: bool = False):
             {"user_id": user_id}
         ).fetchall()
 
-    # Flex Messageを返す
-    return create_task_list_flex(tasks, show_all=show_all)
+    # ⭐ Phase 1: プラン制御 - タスクをプランに応じてフィルタリング
+    plan_controller = get_plan_controller()
+    tasks_as_dict = [
+        {
+            "id": str(task[0]),
+            "title": task[1],
+            "due_date": task[2],
+            "status": task[3],
+            "priority": task[4],
+            "category": task[5],
+            "metadata": task[6]
+        }
+        for task in tasks
+    ]
+    filtered_tasks = plan_controller.filter_tasks_by_plan(str(user_id), tasks_as_dict)
+
+    # Flex Messageを返す（フィルタリング済みタスク）
+    return create_task_list_flex(filtered_tasks, show_all=show_all)
 
 
 def complete_task(user_id: str, message: str) -> str:
