@@ -1649,25 +1649,64 @@ def handle_postback(event: PostbackEvent):
     if action == 'view_task_detail':
         task_id = params.get('task_id', '')
 
-        # タスク情報を取得
+        # ユーザーIDを取得
         with engine.connect() as conn:
-            task_data = conn.execute(
+            user_data = conn.execute(
                 sqlalchemy.text(
                     """
-                    SELECT id, title, description, due_date, priority, category, metadata
-                    FROM tasks
-                    WHERE id = :task_id
+                    SELECT u.id
+                    FROM users u
+                    WHERE u.line_user_id = :line_user_id
                     """
                 ),
-                {"task_id": task_id}
+                {"line_user_id": line_user_id}
             ).fetchone()
 
-            if not task_data:
-                reply_message = "タスクが見つかりません。"
+            if not user_data:
+                reply_message = "ユーザー情報が見つかりません。"
             else:
-                # タスク詳細のFlex Messageを生成
-                from flex_messages import create_task_detail_flex
-                reply_message = create_task_detail_flex(task_data)
+                user_id = str(user_data[0])
+
+                # タスク情報を取得
+                task_data = conn.execute(
+                    sqlalchemy.text(
+                        """
+                        SELECT id, title, description, due_date, priority, category, metadata, user_id
+                        FROM tasks
+                        WHERE id = :task_id
+                        """
+                    ),
+                    {"task_id": task_id}
+                ).fetchone()
+
+                if not task_data:
+                    reply_message = "タスクが見つかりません。"
+                elif str(task_data[7]) != user_id:
+                    reply_message = "このタスクにはアクセスできません。"
+                else:
+                    # タスクのインデックスを取得（無料プランの制限チェックに使用）
+                    all_tasks = conn.execute(
+                        sqlalchemy.text(
+                            """
+                            SELECT id
+                            FROM tasks
+                            WHERE user_id = :user_id AND is_deleted = false AND status = 'pending'
+                            ORDER BY due_date ASC
+                            """
+                        ),
+                        {"user_id": user_id}
+                    ).fetchall()
+
+                    task_index = next((i for i, t in enumerate(all_tasks) if str(t[0]) == task_id), -1)
+
+                    # プラン制御のチェック
+                    plan_controller = get_plan_controller()
+                    if not plan_controller.can_access_task_details(user_id, task_index):
+                        reply_message = plan_controller.get_upgrade_message()
+                    else:
+                        # タスク詳細のFlex Messageを生成（user_idフィールドを除外）
+                        from flex_messages import create_task_detail_flex
+                        reply_message = create_task_detail_flex(task_data[:7])
 
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
