@@ -1376,7 +1376,7 @@ def get_task_list_message(user_id: str, show_all: bool = False):
                 """
                 SELECT id, title, due_date, status, priority, category, metadata
                 FROM tasks
-                WHERE user_id = :user_id AND is_deleted = false
+                WHERE user_id = :user_id
                 ORDER BY
                     CASE status
                         WHEN 'pending' THEN 1
@@ -1403,7 +1403,21 @@ def get_task_list_message(user_id: str, show_all: bool = False):
         }
         for task in tasks
     ]
-    filtered_tasks = plan_controller.filter_tasks_by_plan(str(user_id), tasks_as_dict)
+    filtered_tasks_dict = plan_controller.filter_tasks_by_plan(str(user_id), tasks_as_dict)
+
+    # 辞書形式をタプル形式に戻す（create_task_list_flexがタプルを期待しているため）
+    filtered_tasks = [
+        (
+            task["id"],
+            task["title"],
+            task["due_date"],
+            task["status"],
+            task["priority"],
+            task["category"],
+            task["metadata"]
+        )
+        for task in filtered_tasks_dict
+    ]
 
     # Flex Messageを返す（フィルタリング済みタスク）
     return create_task_list_flex(filtered_tasks, show_all=show_all)
