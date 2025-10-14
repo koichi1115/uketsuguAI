@@ -1390,6 +1390,8 @@ def get_task_list_message(user_id: str, show_all: bool = False):
         ).fetchall()
 
     # ⭐ Phase 1: プラン制御 - タスクをプランに応じてフィルタリング
+    print(f"📊 Phase 1: タスク数（フィルタリング前）: {len(tasks)}")
+
     plan_controller = get_plan_controller()
     tasks_as_dict = [
         {
@@ -1403,7 +1405,10 @@ def get_task_list_message(user_id: str, show_all: bool = False):
         }
         for task in tasks
     ]
+
+    print(f"🔐 Phase 1: プラン制御を実行 (user_id: {user_id})")
     filtered_tasks_dict = plan_controller.filter_tasks_by_plan(str(user_id), tasks_as_dict)
+    print(f"📊 Phase 1: タスク数（フィルタリング後）: {len(filtered_tasks_dict)}")
 
     # 辞書形式をタプル形式に戻す（create_task_list_flexがタプルを期待しているため）
     filtered_tasks = [

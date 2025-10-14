@@ -38,6 +38,7 @@ class PlanController:
             フィルタリング後のタスクリスト
         """
         is_premium = self.subscription_manager.is_premium_user(user_id)
+        print(f"🎫 プラン確認: user_id={user_id}, is_premium={is_premium}, tasks_count={len(tasks)}")
 
         if is_premium:
             # 有料プラン: すべて表示

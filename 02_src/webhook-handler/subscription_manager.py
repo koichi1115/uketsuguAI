@@ -83,15 +83,19 @@ class SubscriptionManager:
             有料プランならTrue、無料プランまたはサブスクなしならFalse
         """
         subscription = self.get_user_subscription(user_id)
+        print(f"💳 サブスクリプション取得: user_id={user_id}, subscription={subscription}")
 
         if not subscription:
+            print(f"❌ サブスクリプションなし → 無料プラン")
             return False
 
         # アクティブなベータ版または標準プランなら有料ユーザー
         is_active = subscription["status"] == self.STATUS_ACTIVE
         is_paid_plan = subscription["plan_type"] in [self.PLAN_BETA, self.PLAN_STANDARD]
 
-        return is_active and is_paid_plan
+        result = is_active and is_paid_plan
+        print(f"✅ サブスクリプション判定: is_active={is_active}, is_paid_plan={is_paid_plan}, result={result}")
+        return result
 
     def create_checkout_session(
         self,
