@@ -4,7 +4,7 @@
 基本タスク生成後に、ユーザーの詳細な状況を把握するための
 追加質問を動的に生成する
 """
-
+import json
 from typing import List, Dict, Optional
 import sqlalchemy
 from datetime import datetime, timedelta
@@ -151,7 +151,7 @@ def _save_questions_to_db(user_id: str, questions: List[FollowUpQuestion], conn)
                     'question_text': question.question_text,
                     'question_type': question.question_type,
                     'question_key': question.question_key,
-                    'options': sqlalchemy.text('NULL') if not question.options else str(question.options),
+                    'options': None if not question.options else json.dumps(question.options, ensure_ascii=False),
                     'display_order': question.display_order
                 }
             )

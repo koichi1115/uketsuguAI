@@ -154,24 +154,85 @@ def create_task_list_flex(tasks, user_name="", show_all=False):
     for i, task in enumerate(pending_tasks[:display_count]):
         task_id, title, due_date, status, priority, category, metadata = task
 
-        # 優先度による絵文字設定
-        priority_emoji = "🔴" if priority == "high" else "🟡" if priority == "medium" else "⚪"
-
-        # 期限表示
-        due_str = due_date.strftime("%m/%d") if due_date else "期限なし"
-
-        # メモアイコン
+        # メタデータから masked フラグを確認
         import json
+        is_masked = False
         has_memo = False
         if metadata:
             if isinstance(metadata, str):
                 metadata_dict = json.loads(metadata)
             else:
                 metadata_dict = metadata
+            is_masked = metadata_dict.get("masked", False)
             memo = metadata_dict.get("memo", "")
             has_memo = bool(memo.strip())
 
+        # 優先度による絵文字設定（マスクされている場合は優先度を隠す）
+        if is_masked:
+            priority_emoji = "🔒"
+        else:
+            priority_emoji = "🔴" if priority == "high" else "🟡" if priority == "medium" else "⚪"
+
+        # 期限表示
+        due_str = due_date.strftime("%m/%d") if due_date else "期限なし"
+
         title_with_icon = f"{title} 📝" if has_memo else title
+
+        # マスクされたタスクの場合は背景色を薄い灰色にし、ボタンの動作を変更
+        if is_masked:
+            background_color = "#F5F5F5"
+            detail_button = {
+                "type": "button",
+                "action": {
+                    "type": "postback",
+                    "label": "🔒 詳細",
+                    "data": f"action=view_task_detail&task_id={task_id}",
+                    "displayText": "有料プラン加入後に利用可能です"
+                },
+                "style": "link",
+                "height": "sm",
+                "flex": 1
+            }
+            complete_button = {
+                "type": "button",
+                "action": {
+                    "type": "postback",
+                    "label": "🔒 完了",
+                    "data": f"action=view_task_detail&task_id={task_id}",
+                    "displayText": "有料プラン加入後に利用可能です"
+                },
+                "style": "link",
+                "height": "sm",
+                "flex": 1,
+                "color": "#999999"
+            }
+        else:
+            background_color = "#FFFFFF"
+            detail_button = {
+                "type": "button",
+                "action": {
+                    "type": "postback",
+                    "label": "📋 詳細",
+                    "data": f"action=view_task_detail&task_id={task_id}",
+                    "displayText": f"「{title}」の詳細"
+                },
+                "style": "link",
+                "height": "sm",
+                "flex": 1
+            }
+            complete_button = {
+                "type": "button",
+                "action": {
+                    "type": "postback",
+                    "label": "✅ 完了",
+                    "data": f"action=complete_task&task_id={task_id}",
+                    "displayText": f"「{title}」を完了しました"
+                },
+                "style": "primary",
+                "color": "#17C964",
+                "height": "sm",
+                "flex": 1
+            }
 
         # タスクボックス
         task_box = {
@@ -226,38 +287,15 @@ def create_task_list_flex(tasks, user_name="", show_all=False):
                     "type": "box",
                     "layout": "horizontal",
                     "contents": [
-                        {
-                            "type": "button",
-                            "action": {
-                                "type": "postback",
-                                "label": "📋 詳細",
-                                "data": f"action=view_task_detail&task_id={task_id}",
-                                "displayText": f"「{title}」の詳細"
-                            },
-                            "style": "link",
-                            "height": "sm",
-                            "flex": 1
-                        },
-                        {
-                            "type": "button",
-                            "action": {
-                                "type": "postback",
-                                "label": "✅ 完了",
-                                "data": f"action=complete_task&task_id={task_id}",
-                                "displayText": f"「{title}」を完了しました"
-                            },
-                            "style": "primary",
-                            "color": "#17C964",
-                            "height": "sm",
-                            "flex": 1
-                        }
+                        detail_button,
+                        complete_button
                     ],
                     "spacing": "sm",
                     "margin": "md"
                 }
             ],
             "paddingAll": "12px",
-            "backgroundColor": "#FFFFFF",
+            "backgroundColor": background_color,
             "cornerRadius": "8px",
             "margin": "md" if i > 0 else "none"
         }
