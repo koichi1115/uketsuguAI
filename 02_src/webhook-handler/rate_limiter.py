@@ -15,7 +15,13 @@ class RateLimiter:
     DAILY_LIMIT = 100
 
     # 制限超過時のエラーメッセージ
-    LIMIT_EXCEEDED_MESSAGE = "制限を超えました。24時間待ってから再開してください"
+    LIMIT_EXCEEDED_MESSAGE = """⚠️ 本日の利用制限に達しました
+
+1日あたり100メッセージまでご利用いただけます。
+24時間後に再度お試しください。
+
+💎 有料プランでは制限が緩和されます
+「アップグレード」と入力して詳細をご確認ください。"""
 
     def __init__(self, engine: sqlalchemy.engine.Engine):
         """

@@ -286,11 +286,11 @@ def enqueue_tips_enhancement(user_id: str, line_user_id: str):
 def enqueue_ai_response_generation(user_id: str, line_user_id: str, user_message: str):
     """Cloud TasksにAI応答生成ジョブを投入"""
     client = tasks_v2.CloudTasksClient()
-    # TODO: AI応答用に別のキュー(ai-response-queue)を立てることを推奨
-    queue_name = 'task-generation-queue'
+    # 削除したキュー名は30日間再利用不可のため、v2を使用
+    queue_name = 'task-generation-queue-v2'
     parent = client.queue_path(PROJECT_ID, REGION, queue_name)
 
-    worker_url = f"https://{REGION}-{PROJECT_ID}.cloudfunctions.net/ai_response_worker"
+    worker_url = f"https://{REGION}-{PROJECT_ID}.cloudfunctions.net/ai-response-worker"
 
     payload = json.dumps({
         'user_id': str(user_id),
@@ -330,6 +330,40 @@ def ai_response_worker(request: Request):
             return jsonify({"error": "user_id, line_user_id, and user_message are required"}), 400
 
         print(f"🔄 AI応答生成開始: user_id={user_id}")
+
+        # ユーザーメッセージを会話履歴に保存（非同期処理のため明示的に保存）
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            # 最新の会話履歴をチェック（重複回避）
+            latest_message = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT message, role
+                    FROM conversation_history
+                    WHERE user_id = :user_id
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"user_id": user_id}
+            ).fetchone()
+
+            # 最新メッセージがユーザーメッセージと異なる場合のみ保存
+            if not latest_message or latest_message[0] != user_message or latest_message[1] != 'user':
+                conn.execute(
+                    sqlalchemy.text(
+                        """
+                        INSERT INTO conversation_history (user_id, role, message)
+                        VALUES (:user_id, 'user', :message)
+                        """
+                    ),
+                    {
+                        "user_id": user_id,
+                        "message": user_message
+                    }
+                )
+                conn.commit()
+                print(f"💾 ユーザーメッセージを会話履歴に保存: {user_message[:50]}...")
 
         # AI応答を生成
         ai_reply = generate_ai_response(user_id, user_message)
@@ -703,17 +737,20 @@ def handle_message(event: MessageEvent):
     user_id = user_data[0]
 
     # ⭐ Phase 1: レート制限チェック
-    is_limited, limit_message = is_rate_limited(str(user_id), engine)
-    if is_limited:
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=limit_message)]
+    # ただし、アップグレード関連メッセージと基本コマンドは除外
+    bypass_rate_limit_messages = ['アップグレード', '有料プラン', '課金', 'プラン変更', 'ヘルプ', '設定']
+    if user_message not in bypass_rate_limit_messages:
+        is_limited, limit_message = is_rate_limited(str(user_id), engine)
+        if is_limited:
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=limit_message)]
+                    )
                 )
-            )
-        return  # レート制限超過のため処理終了
+            return  # レート制限超過のため処理終了
     relationship = user_data[1]
     prefecture = user_data[2]
     municipality = user_data[3]
@@ -1203,9 +1240,9 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
                     # 「完了1」「1完了」「完了１」「１完了」などのパターンをチェック
                     return complete_task(user_id, message)
                 else:
-                    # AI応答生成を非同期化
+                    # AI応答を非同期で生成（Cloud Tasksキュー経由）
                     enqueue_ai_response_generation(user_id, line_user_id, message)
-                    return "🤖 AIが応答を考えています... しばらくお待ちください。"
+                    return "AIが応答を考えています...\nしばらくお待ちください"
             else:
                 # タスク生成をCloud Tasksに投入（非同期）
                 enqueue_task_generation(user_id, line_user_id)
@@ -1531,7 +1568,7 @@ def generate_ai_response(user_id: str, user_message: str) -> str:
             {"user_id": user_id}
         ).fetchone()
 
-        # 直近の会話履歴を取得（最新10件）
+        # 直近の会話履歴を取得（最新20件 = 約10往復分）
         conversation_history = conn.execute(
             sqlalchemy.text(
                 """
@@ -1539,7 +1576,7 @@ def generate_ai_response(user_id: str, user_message: str) -> str:
                 FROM conversation_history
                 WHERE user_id = :user_id
                 ORDER BY created_at DESC
-                LIMIT 10
+                LIMIT 20
                 """
             ),
             {"user_id": user_id}
@@ -1563,6 +1600,7 @@ def generate_ai_response(user_id: str, user_message: str) -> str:
 - 手続きの期限や必要書類について具体的にアドバイスする
 - 専門的な内容は分かりやすく説明する
 - 個人情報（電話番号、マイナンバー等）の入力は避けるよう注意を促す
+- 会話の文脈を理解して、前の質問の続きにも適切に答える
 
 【回答スタイル】
 - 簡潔で分かりやすく（200文字以内）
@@ -1574,7 +1612,7 @@ def generate_ai_response(user_id: str, user_message: str) -> str:
     # 会話履歴を逆順にして（古い順に）プロンプトに追加
     conversation_context = ""
     for i, (role, msg) in enumerate(reversed(conversation_history)):
-        if i >= 5:  # 直近5件のみ
+        if i >= 10:  # 直近10件のみ（約5往復分）
             break
         if role == "user":
             conversation_context += f"ユーザー: {msg}\n"
