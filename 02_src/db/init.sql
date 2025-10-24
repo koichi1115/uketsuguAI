@@ -16,6 +16,7 @@ CREATE TABLE users (
     line_user_id VARCHAR(255) NOT NULL UNIQUE,
     display_name VARCHAR(255),
     status VARCHAR(50) NOT NULL DEFAULT 'active',
+    stripe_customer_id VARCHAR(255) UNIQUE,
     last_login_at TIMESTAMP,
     is_deleted BOOLEAN NOT NULL DEFAULT false,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -24,6 +25,7 @@ CREATE TABLE users (
 
 CREATE INDEX idx_users_line_user_id ON users(line_user_id);
 CREATE INDEX idx_users_status ON users(status) WHERE is_deleted = false;
+CREATE INDEX idx_users_stripe_customer_id ON users(stripe_customer_id) WHERE stripe_customer_id IS NOT NULL;
 
 CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
 FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();

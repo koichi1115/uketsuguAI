@@ -47,6 +47,13 @@ from question_generator import (
 from conversation_flow_manager import ConversationFlowManager, ConversationState
 from task_personalizer import generate_personalized_tasks
 from task_enhancer import enhance_tasks_with_tips, generate_general_tips_task
+from subscription_service import (
+    get_user_subscription,
+    get_plan_display_name,
+    get_status_display_name,
+    cancel_subscription
+)
+from stripe_webhook import verify_stripe_signature, process_webhook_event
 
 # 環境変数からGCP設定を取得
 PROJECT_ID = os.environ.get('GCP_PROJECT_ID')
@@ -607,10 +614,94 @@ def handle_message(event: MessageEvent):
         )
         conn.commit()
 
-    # プロフィール収集フロー
-    reply_message = process_profile_collection(
-        user_id, line_user_id, user_message, relationship, prefecture, municipality, death_date
-    )
+    # サブスクリプション関連キーワードのチェック
+    subscription_keywords = ['サブスクリプション', 'サブスク', '有料', 'プラン', 'アカウント', '会員']
+    cancel_keywords = ['解約', 'キャンセル', '退会']
+
+    if any(keyword in user_message for keyword in subscription_keywords):
+        # サブスクリプション情報を表示
+        subscription = get_user_subscription(engine, user_id)
+
+        if not subscription:
+            reply_message = """📋 サブスクリプション情報
+
+現在、有料プランに加入していません。
+
+💡 有料プランに加入すると、より多くの機能をご利用いただけます。"""
+        else:
+            plan_name = get_plan_display_name(subscription['plan_type'])
+            status_name = get_status_display_name(subscription['status'])
+            start_date = subscription['start_date'].strftime('%Y年%m月%d日')
+
+            if subscription['end_date']:
+                end_date = subscription['end_date'].strftime('%Y年%m月%d日')
+                end_date_text = f"\n次回更新日: {end_date}"
+            else:
+                end_date_text = ""
+
+            reply_message = f"""📋 サブスクリプション情報
+
+プラン: {plan_name}
+ステータス: {status_name}
+開始日: {start_date}{end_date_text}
+
+💡 解約をご希望の場合は「サブスクリプションを解約」とメッセージを送信してください。"""
+
+    elif any(keyword in user_message for keyword in cancel_keywords) and 'サブスク' in user_message:
+        # 解約確認フローを開始
+        subscription = get_user_subscription(engine, user_id)
+
+        if not subscription:
+            reply_message = "有効なサブスクリプションが見つかりません。"
+        elif user_message == "解約を確定":
+            # 解約処理実行
+            stripe_subscription_id = subscription['stripe_subscription_id']
+            success = cancel_subscription(engine, user_id, stripe_subscription_id)
+
+            if success:
+                reply_message = """✅ サブスクリプションを解約しました
+
+ご利用ありがとうございました。
+
+期間終了までは引き続きサービスをご利用いただけます。
+
+また何かお困りのことがございましたら、お気軽にお声がけください。"""
+            else:
+                reply_message = """❌ 解約処理に失敗しました
+
+申し訳ございません。解約処理中にエラーが発生しました。
+
+しばらく経ってから再度お試しいただくか、サポートまでお問い合わせください。"""
+        else:
+            # 解約確認メッセージ
+            plan_name = get_plan_display_name(subscription['plan_type'])
+            reply_message = {
+                "type": "text_with_quick_reply",
+                "text": f"""⚠️ サブスクリプション解約確認
+
+現在のプラン: {plan_name}
+
+解約すると、以下の影響があります：
+• 有料機能が利用できなくなります
+• 解約後も期間終了まではご利用いただけます
+
+本当に解約してよろしいですか？""",
+                "quick_reply": QuickReply(
+                    items=[
+                        QuickReplyItem(
+                            action=MessageAction(label="解約する", text="解約を確定")
+                        ),
+                        QuickReplyItem(
+                            action=MessageAction(label="キャンセル", text="解約をキャンセル")
+                        )
+                    ]
+                )
+            }
+    else:
+        # プロフィール収集フロー
+        reply_message = process_profile_collection(
+            user_id, line_user_id, user_message, relationship, prefecture, municipality, death_date
+        )
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
@@ -2176,6 +2267,198 @@ def handle_postback(event: PostbackEvent):
                 )
             )
 
+    elif action == 'view_subscription':
+        # サブスクリプションステータス表示
+        with engine.connect() as conn:
+            user_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT u.id
+                    FROM users u
+                    WHERE u.line_user_id = :line_user_id
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            ).fetchone()
+
+            if not user_data:
+                reply_message = "ユーザー情報が見つかりません。"
+            else:
+                user_id = user_data[0]
+                subscription = get_user_subscription(engine, user_id)
+
+                if not subscription:
+                    reply_message = """📋 サブスクリプション情報
+
+現在、有料プランに加入していません。
+
+💡 有料プランに加入すると、より多くの機能をご利用いただけます。"""
+                else:
+                    plan_name = get_plan_display_name(subscription['plan_type'])
+                    status_name = get_status_display_name(subscription['status'])
+                    start_date = subscription['start_date'].strftime('%Y年%m月%d日')
+
+                    if subscription['end_date']:
+                        end_date = subscription['end_date'].strftime('%Y年%m月%d日')
+                        end_date_text = f"\n次回更新日: {end_date}"
+                    else:
+                        end_date_text = ""
+
+                    reply_message = f"""📋 サブスクリプション情報
+
+プラン: {plan_name}
+ステータス: {status_name}
+開始日: {start_date}{end_date_text}
+
+💡 解約をご希望の場合は、下記ボタンからお手続きください。"""
+
+        # Quick Replyで解約ボタンを追加
+        quick_reply_items = []
+        if subscription and subscription['status'] in ['active', 'trialing']:
+            quick_reply_items.append(
+                QuickReplyItem(
+                    action=MessageAction(
+                        label="解約する",
+                        text="サブスクリプションを解約"
+                    )
+                )
+            )
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+
+            if quick_reply_items:
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(
+                            text=reply_message,
+                            quick_reply=QuickReply(items=quick_reply_items)
+                        )]
+                    )
+                )
+            else:
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_message)]
+                    )
+                )
+
+    elif action == 'confirm_cancel_subscription':
+        # 解約確認
+        with engine.connect() as conn:
+            user_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT u.id
+                    FROM users u
+                    WHERE u.line_user_id = :line_user_id
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            ).fetchone()
+
+            if not user_data:
+                reply_message = "ユーザー情報が見つかりません。"
+            else:
+                user_id = user_data[0]
+                subscription = get_user_subscription(engine, user_id)
+
+                if not subscription:
+                    reply_message = "有効なサブスクリプションが見つかりません。"
+                else:
+                    plan_name = get_plan_display_name(subscription['plan_type'])
+                    reply_message = f"""⚠️ サブスクリプション解約確認
+
+現在のプラン: {plan_name}
+
+解約すると、以下の影響があります：
+• 有料機能が利用できなくなります
+• 解約後も期間終了まではご利用いただけます
+
+本当に解約してよろしいですか？"""
+
+        # Quick Replyで確認ボタンを追加
+        quick_reply_items = [
+            QuickReplyItem(
+                action=MessageAction(
+                    label="解約する",
+                    text="解約を確定"
+                )
+            ),
+            QuickReplyItem(
+                action=MessageAction(
+                    label="キャンセル",
+                    text="解約をキャンセル"
+                )
+            )
+        ]
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(
+                        text=reply_message,
+                        quick_reply=QuickReply(items=quick_reply_items)
+                    )]
+                )
+            )
+
+    elif action == 'cancel_subscription':
+        # 解約処理
+        with engine.connect() as conn:
+            user_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT u.id
+                    FROM users u
+                    WHERE u.line_user_id = :line_user_id
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            ).fetchone()
+
+            if not user_data:
+                reply_message = "ユーザー情報が見つかりません。"
+            else:
+                user_id = user_data[0]
+                subscription = get_user_subscription(engine, user_id)
+
+                if not subscription:
+                    reply_message = "有効なサブスクリプションが見つかりません。"
+                else:
+                    stripe_subscription_id = subscription['stripe_subscription_id']
+
+                    # Stripe経由で解約
+                    success = cancel_subscription(engine, user_id, stripe_subscription_id)
+
+                    if success:
+                        reply_message = """✅ サブスクリプションを解約しました
+
+ご利用ありがとうございました。
+
+期間終了までは引き続きサービスをご利用いただけます。
+
+また何かお困りのことがございましたら、お気軽にお声がけください。"""
+                    else:
+                        reply_message = """❌ 解約処理に失敗しました
+
+申し訳ございません。解約処理中にエラーが発生しました。
+
+しばらく経ってから再度お試しいただくか、サポートまでお問い合わせください。"""
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_message)]
+                )
+            )
+
     else:
         # 未知のアクション
         with ApiClient(configuration) as api_client:
@@ -2577,3 +2860,42 @@ def get_settings_message(user_id: str, relationship: str, prefecture: str, munic
             "paddingAll": "20px"
         }
     }
+
+
+@functions_framework.http
+def stripe_webhook(request: Request):
+    """Stripe Webhook エントリーポイント"""
+
+    # 署名検証用のシークレットを取得
+    webhook_secret = get_secret('STRIPE_WEBHOOK_SECRET')
+
+    # リクエストボディと署名を取得
+    payload = request.get_data(as_text=True)
+    sig_header = request.headers.get('Stripe-Signature', '')
+
+    print(f"📨 Received Stripe webhook. Signature: {sig_header[:50]}...")
+
+    # 署名検証
+    event = verify_stripe_signature(payload, sig_header, webhook_secret)
+
+    if not event:
+        print("❌ Stripe signature verification failed")
+        abort(400)
+
+    # イベント処理
+    try:
+        engine = get_db_engine()
+        success = process_webhook_event(engine, event)
+
+        if success:
+            print(f"✅ Stripe webhook processed successfully")
+            return jsonify({'status': 'received'}), 200
+        else:
+            print(f"⚠️ Stripe webhook processing failed")
+            return jsonify({'status': 'error'}), 500
+
+    except Exception as e:
+        print(f"❌ Error processing Stripe webhook: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'status': 'error', 'message': str(e)}), 500
