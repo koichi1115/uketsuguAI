@@ -47,6 +47,7 @@ from question_generator import (
 from conversation_flow_manager import ConversationFlowManager, ConversationState
 from task_personalizer import generate_personalized_tasks
 from task_enhancer import enhance_tasks_with_tips, generate_general_tips_task
+from auth_utils import verify_user_ownership, AuthorizationError
 
 # 環境変数からGCP設定を取得
 PROJECT_ID = os.environ.get('GCP_PROJECT_ID')
@@ -279,10 +280,18 @@ def generate_tasks_worker(request: Request):
         if not line_user_id:
             return jsonify({"error": "line_user_id is required"}), 400
 
-        print(f"🔄 Step 1: 基本タスク生成開始: user_id={user_id}")
-
         # データベース接続
         engine = get_db_engine()
+
+        # ユーザー所有権検証
+        with engine.connect() as conn:
+            try:
+                verify_user_ownership(conn, line_user_id, user_id)
+            except AuthorizationError as e:
+                print(f"❌ 認可エラー: {e}")
+                return jsonify({"error": "Unauthorized access"}), 403
+
+        print(f"🔄 Step 1: 基本タスク生成開始: user_id={user_id}")
 
         # 会話フロー管理初期化
         with engine.connect() as conn:
@@ -2207,9 +2216,17 @@ def personalized_tasks_worker(request: Request):
         if not user_id or not line_user_id:
             return jsonify({"error": "user_id and line_user_id are required"}), 400
 
-        print(f"🔄 Step 2: 個別タスク生成開始: user_id={user_id}")
-
         engine = get_db_engine()
+
+        # ユーザー所有権検証
+        with engine.connect() as conn:
+            try:
+                verify_user_ownership(conn, line_user_id, user_id)
+            except AuthorizationError as e:
+                print(f"❌ 認可エラー: {e}")
+                return jsonify({"error": "Unauthorized access"}), 403
+
+        print(f"🔄 Step 2: 個別タスク生成開始: user_id={user_id}")
 
         # Step 2開始をマーク
         with engine.connect() as conn:
@@ -2311,9 +2328,17 @@ def tips_enhancement_worker(request: Request):
         if not user_id or not line_user_id:
             return jsonify({"error": "user_id and line_user_id are required"}), 400
 
-        print(f"🔄 Step 3: Tips収集開始: user_id={user_id}")
-
         engine = get_db_engine()
+
+        # ユーザー所有権検証
+        with engine.connect() as conn:
+            try:
+                verify_user_ownership(conn, line_user_id, user_id)
+            except AuthorizationError as e:
+                print(f"❌ 認可エラー: {e}")
+                return jsonify({"error": "Unauthorized access"}), 403
+
+        print(f"🔄 Step 3: Tips収集開始: user_id={user_id}")
 
         # Step 3開始をマーク
         with engine.connect() as conn:
