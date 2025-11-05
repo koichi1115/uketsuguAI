@@ -12,6 +12,7 @@ import json
 from google import genai
 from google.genai import types
 from google.cloud import secretmanager
+from privacy_utils import anonymize_profile_for_ai
 
 
 PROJECT_ID = os.environ.get('GCP_PROJECT', 'uketsuguai-dev')
@@ -270,9 +271,12 @@ def generate_general_tips_task(user_id: str, basic_profile: Dict, conn) -> bool:
         gemini_api_key = get_secret('GEMINI_API_KEY')
         client = genai.Client(api_key=gemini_api_key)
 
-        relationship = basic_profile.get('relationship', '遺族')
+        # プライバシー保護：AIに送信する情報を匿名化
+        print("🔒 プライバシー保護: プロファイル情報を匿名化中...")
+        anonymized_profile = anonymize_profile_for_ai(basic_profile)
+        generalized_relationship = anonymized_profile.get('relationship', '遺族')
 
-        prompt = f"""あなたは死後手続きの専門家です。{relationship}として知っておくべき、全体的なお得情報や注意点を収集してください。
+        prompt = f"""あなたは死後手続きの専門家です。{generalized_relationship}として知っておくべき、全体的なお得情報や注意点を収集してください。
 
 【収集すべき情報】
 1. 多くの人が知らない給付金・補助金
@@ -281,7 +285,7 @@ def generate_general_tips_task(user_id: str, basic_profile: Dict, conn) -> bool:
 4. 「先にこれをやっておくべきだった」という後悔談
 5. 窓口で教えてもらえないお得情報
 
-SNS・ブログから、{relationship}向けの実用的な情報を収集してください。
+SNS・ブログから、{generalized_relationship}向けの実用的な情報を収集してください。
 """
 
         tips_response = client.models.generate_content(

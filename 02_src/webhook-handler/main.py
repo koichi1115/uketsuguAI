@@ -52,6 +52,10 @@ from auth_utils import verify_user_ownership, AuthorizationError
 # 環境変数からGCP設定を取得
 PROJECT_ID = os.environ.get('GCP_PROJECT_ID')
 REGION = os.environ.get('GCP_REGION', 'asia-northeast1')
+SERVICE_ACCOUNT_EMAIL = os.environ.get(
+    'SERVICE_ACCOUNT_EMAIL',
+    f'webhook-handler@{PROJECT_ID}.iam.gserviceaccount.com'
+)
 
 # グローバル変数（遅延初期化）
 _handler = None
@@ -62,11 +66,33 @@ _gemini_client = None
 
 
 def get_secret(secret_id: str) -> str:
-    """Secret Managerからシークレットを取得"""
-    client = secretmanager.SecretManagerServiceClient()
-    name = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest"
-    response = client.access_secret_version(request={"name": name})
-    return response.payload.data.decode("UTF-8")
+    """
+    Secret Managerからシークレットを取得
+
+    Args:
+        secret_id: シークレットID
+
+    Returns:
+        シークレット値
+
+    Raises:
+        Exception: シークレット取得に失敗した場合
+    """
+    try:
+        client = secretmanager.SecretManagerServiceClient()
+        name = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest"
+        response = client.access_secret_version(request={"name": name})
+        secret_value = response.payload.data.decode("UTF-8")
+
+        # ログにシークレット値を出力しない（セキュリティ対策）
+        print(f"✅ シークレット取得成功: {secret_id}")
+        return secret_value
+
+    except Exception as e:
+        # エラー詳細をログに記録（シークレット値は含めない）
+        print(f"❌ シークレット取得エラー: secret_id={secret_id}, error={type(e).__name__}")
+        # 本番環境では適切なエラーハンドリングを実装
+        raise Exception(f"Failed to retrieve secret: {secret_id}") from e
 
 
 def validate_signature(body: str, signature: str, channel_secret: str) -> bool:
@@ -137,10 +163,15 @@ def get_db_engine():
             )
             return conn
 
-        # SQLAlchemy エンジン
+        # SQLAlchemy エンジン（接続プール設定を追加）
         _engine = sqlalchemy.create_engine(
             "postgresql+pg8000://",
             creator=get_db_connection,
+            pool_size=5,           # 同時接続数の上限
+            max_overflow=10,       # pool_sizeを超えた場合の追加接続数
+            pool_timeout=30,       # 接続取得のタイムアウト（秒）
+            pool_recycle=1800,     # 接続の再利用期限（30分）
+            pool_pre_ping=True,    # 接続の有効性を事前確認
         )
 
     return _engine
@@ -188,7 +219,7 @@ def enqueue_task_generation(user_id: str, line_user_id: str):
             'headers': {'Content-Type': 'application/json'},
             'body': payload,
             'oidc_token': {
-                'service_account_email': 'webhook-handler@uketsuguai-dev.iam.gserviceaccount.com'
+                'service_account_email': SERVICE_ACCOUNT_EMAIL
             }
         }
     }
@@ -218,7 +249,7 @@ def enqueue_personalized_task_generation(user_id: str, line_user_id: str):
             'headers': {'Content-Type': 'application/json'},
             'body': payload,
             'oidc_token': {
-                'service_account_email': 'webhook-handler@uketsuguai-dev.iam.gserviceaccount.com'
+                'service_account_email': SERVICE_ACCOUNT_EMAIL
             }
         }
     }
@@ -247,7 +278,7 @@ def enqueue_tips_enhancement(user_id: str, line_user_id: str):
             'headers': {'Content-Type': 'application/json'},
             'body': payload,
             'oidc_token': {
-                'service_account_email': 'webhook-handler@uketsuguai-dev.iam.gserviceaccount.com'
+                'service_account_email': SERVICE_ACCOUNT_EMAIL
             }
         }
     }
