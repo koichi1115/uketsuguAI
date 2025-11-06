@@ -393,8 +393,178 @@ anonymized_profile = anonymize_profile_for_ai(profile)
 
 ---
 
+## Issue #18: セキュリティ診断 - IDOR脆弱性と機密データ保護 (深刻度: 高)
+
+### 発見された脆弱性
+
+#### 1. IDOR (Insecure Direct Object Reference) 脆弱性
+
+**問題の詳細:**
+
+タスク操作に関する複数のクエリでuser_id検証が不足しており、他のユーザーのタスクへの不正アクセスが可能でした。
+
+**影響を受けた箇所:**
+
+| 箇所 | 処理内容 | 脆弱なクエリ |
+|------|---------|-------------|
+| main.py:1036-1038 | メモ編集UPDATE | `WHERE id = :task_id` |
+| main.py:1050-1052 | タスク詳細SELECT | `WHERE id = :task_id` |
+| main.py:1362-1364 | タスク完了UPDATE | `WHERE id = :task_id` |
+| main.py:1533-1535 | タスク詳細表示SELECT | `WHERE id = :task_id` |
+| main.py:1629-1631 | ポストバック完了UPDATE | `WHERE id = :task_id` |
+| main.py:1717-1719 | ポストバック未完了UPDATE | `WHERE id = :task_id` |
+
+**攻撃シナリオ:**
+
+攻撃者が他のユーザーのtask_idを推測または取得し、以下の操作が可能でした：
+- 他人のタスクの閲覧
+- 他人のタスクの編集・削除
+- 他人のタスクステータスの変更
+
+---
+
+### 実装した対策
+
+#### 1. 全タスク操作へのuser_id検証追加
+
+**修正内容:**
+
+すべてのタスク関連クエリのWHERE句に`AND user_id = :user_id`を追加：
+
+```python
+# 修正前（脆弱）
+UPDATE tasks
+SET metadata = CAST(:metadata AS jsonb)
+WHERE id = :task_id
+
+# 修正後（セキュア）
+UPDATE tasks
+SET metadata = CAST(:metadata AS jsonb)
+WHERE id = :task_id AND user_id = :user_id
+```
+
+**修正した箇所:**
+1. メモ編集UPDATE (main.py:1036-1038)
+2. タスク詳細SELECT (main.py:1050-1052)
+3. タスク完了UPDATE (main.py:1362-1364)
+4. タスク詳細表示SELECT (main.py:1533-1535)
+5. ポストバック完了UPDATE (main.py:1629-1631)
+6. ポストバック未完了UPDATE (main.py:1717-1719)
+
+#### 2. ポストバックイベントでの認証強化
+
+**修正内容 (main.py:1520-1539):**
+
+`handle_postback`関数の先頭で、line_user_idからuser_idを取得し、認証を実施：
+
+```python
+def handle_postback(event: PostbackEvent):
+    """ポストバックイベント処理"""
+    line_user_id = event.source.user_id
+
+    # line_user_idからuser_idを取得（認証）
+    with engine.connect() as conn:
+        user_result = conn.execute(
+            sqlalchemy.text("SELECT id FROM users WHERE line_user_id = :line_user_id"),
+            {"line_user_id": line_user_id}
+        ).fetchone()
+
+        if not user_result:
+            # ユーザーが見つからない場合はエラー
+            return
+
+        user_id = user_result[0]
+
+    # 以降、すべてのクエリでuser_idを使用
+```
+
+---
+
+#### 2. 機密データの暗号化
+
+**問題の詳細:**
+
+`user_profiles`, `follow_up_questions`, `conversation_history`テーブルの機密データ（死亡日、財務情報、家族関係など）が平文で保存されています。
+
+**実装済みの対策:**
+
+Issue #20で既に実装：
+- 外部AI APIへの送信前に個人情報を匿名化
+- プライバシー保護ユーティリティ（privacy_utils.py）を導入
+
+**追加の推奨事項:**
+
+##### データベースレベルの暗号化（Infrastructure）
+
+Cloud SQLでの保存時暗号化（Encryption at Rest）を有効化：
+
+```bash
+# Cloud SQL インスタンス作成時
+gcloud sql instances create INSTANCE_NAME \
+  --database-version=POSTGRES_14 \
+  --tier=db-f1-micro \
+  --region=asia-northeast1 \
+  --encryption-key=projects/PROJECT_ID/locations/LOCATION/keyRings/KEY_RING/cryptoKeys/KEY_NAME
+```
+
+##### アプリケーションレベルの暗号化（将来の実装）
+
+特に機密性の高いフィールドに対するフィールドレベル暗号化：
+
+```python
+# 将来の実装例
+from cryptography.fernet import Fernet
+
+class EncryptedField:
+    def __init__(self, key):
+        self.cipher = Fernet(key)
+
+    def encrypt(self, plaintext: str) -> str:
+        return self.cipher.encrypt(plaintext.encode()).decode()
+
+    def decrypt(self, ciphertext: str) -> str:
+        return self.cipher.decrypt(ciphertext.encode()).decode()
+
+# 使用例
+encrypted_death_date = cipher.encrypt(death_date)
+# データベースに保存
+```
+
+##### アクセス制御の強化
+
+最小権限の原則：
+- アプリケーション用データベースユーザーの権限を最小限に制限
+- 読み取り専用と読み書き可能なユーザーを分離
+- 定期的な権限監査
+
+---
+
+### セキュリティ強化の効果
+
+| 対策 | 効果 |
+|------|------|
+| IDOR脆弱性の修正 | 他ユーザーのタスクへの不正アクセスを完全に防止 |
+| ポストバック認証強化 | イベント処理の最初に認証を実施 |
+| 個人情報匿名化（Issue #20） | 外部APIへのデータ流出リスクを最小化 |
+
+---
+
+### 修正履歴
+
+| 日付 | 修正内容 | 担当者 |
+|------|---------|--------|
+| 2025-11-05 | Issue #23対応: ユーザー所有権検証の実装 | Claude Code |
+| 2025-11-05 | Issue #22対応: データベース接続プール設定とリソース管理 | Claude Code |
+| 2025-11-05 | Issue #21対応: Secret Managerエラーハンドリングとサービスアカウント環境変数化 | Claude Code |
+| 2025-11-05 | Issue #20対応: 個人情報の匿名化実装 | Claude Code |
+| 2025-11-05 | Issue #18対応: IDOR脆弱性の修正と機密データ保護の推奨事項 | Claude Code |
+
+---
+
 ### 参考資料
 
-- GitHub Issue: #23
+- GitHub Issue: #18, #20, #21, #22, #23
 - OWASP Top 10 - Broken Access Control
+- OWASP Top 10 - Insecure Direct Object References (IDOR)
 - CWE-639: Authorization Bypass Through User-Controlled Key
+- CWE-922: Insecure Storage of Sensitive Information

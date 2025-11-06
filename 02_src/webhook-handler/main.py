@@ -1035,10 +1035,10 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
                     """
                     UPDATE tasks
                     SET metadata = CAST(:metadata AS jsonb)
-                    WHERE id = :task_id
+                    WHERE id = :task_id AND user_id = :user_id
                     """
                 ),
-                {"task_id": task_id, "metadata": metadata}
+                {"task_id": task_id, "user_id": user_id, "metadata": metadata}
             )
             conn.commit()
 
@@ -1048,10 +1048,10 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
                     """
                     SELECT id, title, description, due_date, priority, category, metadata
                     FROM tasks
-                    WHERE id = :task_id
+                    WHERE id = :task_id AND user_id = :user_id
                     """
                 ),
-                {"task_id": task_id}
+                {"task_id": task_id, "user_id": user_id}
             ).fetchone()
 
             if task_data:
@@ -1361,10 +1361,10 @@ def complete_task(user_id: str, message: str) -> str:
                 """
                 UPDATE tasks
                 SET status = 'completed'
-                WHERE id = :task_id
+                WHERE id = :task_id AND user_id = :user_id
                 """
             ),
-            {"task_id": task_id}
+            {"task_id": task_id, "user_id": user_id}
         )
 
         # task_progressに記録
@@ -1517,6 +1517,27 @@ def handle_postback(event: PostbackEvent):
     configuration = get_configuration()
     engine = get_db_engine()
 
+    # line_user_idからuser_idを取得（認証）
+    with engine.connect() as conn:
+        user_result = conn.execute(
+            sqlalchemy.text("SELECT id FROM users WHERE line_user_id = :line_user_id"),
+            {"line_user_id": line_user_id}
+        ).fetchone()
+
+        if not user_result:
+            # ユーザーが見つからない場合はエラー
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text="ユーザー情報が見つかりません。")]
+                    )
+                )
+            return
+
+        user_id = user_result[0]
+
     # ポストバックデータをパース
     params = dict(param.split('=') for param in postback_data.split('&'))
     action = params.get('action', '')
@@ -1524,17 +1545,17 @@ def handle_postback(event: PostbackEvent):
     if action == 'view_task_detail':
         task_id = params.get('task_id', '')
 
-        # タスク情報を取得
+        # タスク情報を取得（user_id検証付き）
         with engine.connect() as conn:
             task_data = conn.execute(
                 sqlalchemy.text(
                     """
                     SELECT id, title, description, due_date, priority, category, metadata
                     FROM tasks
-                    WHERE id = :task_id
+                    WHERE id = :task_id AND user_id = :user_id
                     """
                 ),
-                {"task_id": task_id}
+                {"task_id": task_id, "user_id": user_id}
             ).fetchone()
 
             if not task_data:
@@ -1607,10 +1628,10 @@ def handle_postback(event: PostbackEvent):
                             """
                             UPDATE tasks
                             SET status = 'completed'
-                            WHERE id = :task_id
+                            WHERE id = :task_id AND user_id = :user_id
                             """
                         ),
-                        {"task_id": task_id}
+                        {"task_id": task_id, "user_id": user_id}
                     )
 
                     # task_progressに記録
@@ -1695,10 +1716,10 @@ def handle_postback(event: PostbackEvent):
                             """
                             UPDATE tasks
                             SET status = 'pending'
-                            WHERE id = :task_id
+                            WHERE id = :task_id AND user_id = :user_id
                             """
                         ),
-                        {"task_id": task_id}
+                        {"task_id": task_id, "user_id": user_id}
                     )
 
                     # task_progressに記録
