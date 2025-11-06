@@ -1023,11 +1023,15 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
             import json
             memo_text = message.strip()
 
-            if memo_text:
+            # メモ削除キーワードのチェック（Issue #16対応）
+            delete_keywords = ['削除', 'なし', 'クリア', '消す', 'delete', 'clear', 'none']
+            is_delete = memo_text.lower() in delete_keywords
+
+            if memo_text and not is_delete:
                 # メモがある場合は保存
                 metadata = json.dumps({"memo": memo_text})
             else:
-                # 空白の場合はメモを削除
+                # 削除キーワードまたは空白の場合はメモを削除
                 metadata = json.dumps({"memo": ""})
 
             conn.execute(
@@ -1056,7 +1060,7 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
 
             if task_data:
                 from flex_messages import create_task_detail_flex
-                success_message = "✅ メモを保存しました" if memo_text else "✅ メモを削除しました"
+                success_message = "✅ メモを保存しました" if (memo_text and not is_delete) else "✅ メモを削除しました"
                 return [
                     success_message,
                     {
@@ -2180,7 +2184,7 @@ def handle_postback(event: PostbackEvent):
                 )
                 conn.commit()
 
-                reply_message = "メモを入力してください。\n\n空白のメッセージを送信するとメモが削除されます。"
+                reply_message = "メモを入力してください。\n\nメモを削除する場合は「削除」と送信してください。"
             else:
                 reply_message = "ユーザー情報が見つかりません。"
 
@@ -2227,6 +2231,228 @@ def handle_postback(event: PostbackEvent):
 ⏱️ 生成には5分程度かかります。完了したら通知でお知らせします。"""
             else:
                 reply_message = "ユーザー情報が見つかりません。"
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_message)]
+                )
+            )
+
+    elif action == 'view_subscription_status':
+        # サブスクリプションステータスの確認（Issue #19対応）
+        with engine.connect() as conn:
+            user_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT id, subscription_status, subscription_plan, subscription_start_date, subscription_end_date
+                    FROM users
+                    WHERE line_user_id = :line_user_id
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            ).fetchone()
+
+            if not user_data:
+                reply_message = "ユーザー情報が見つかりません。"
+            else:
+                user_id, status, plan, start_date, end_date = user_data
+
+                # サブスクリプションステータスに応じたメッセージを生成
+                if status == 'active':
+                    status_emoji = "✅"
+                    status_text = "有効"
+                    plan_text = plan or "スタンダードプラン"
+                    start_text = start_date.strftime("%Y年%m月%d日") if start_date else "不明"
+                    end_text = end_date.strftime("%Y年%m月%d日") if end_date else "継続中"
+
+                    reply_message = f"""{status_emoji} サブスクリプションステータス
+
+【現在の状態】
+ステータス: {status_text}
+プラン: {plan_text}
+開始日: {start_text}
+次回更新日: {end_text}
+
+サブスクリプションは正常に継続されています。"""
+
+                elif status == 'cancelled':
+                    status_emoji = "⚠️"
+                    status_text = "解約済み"
+                    end_text = end_date.strftime("%Y年%m月%d日") if end_date else "不明"
+
+                    reply_message = f"""{status_emoji} サブスクリプションステータス
+
+【現在の状態】
+ステータス: {status_text}
+利用可能期限: {end_text}
+
+サブスクリプションは解約されています。
+期限まではサービスをご利用いただけます。"""
+
+                else:
+                    # 未契約またはその他の状態
+                    reply_message = """💡 サブスクリプション未契約
+
+現在サブスクリプションに未登録です。
+プレミアム機能をご利用いただくには、サブスクリプションへの登録が必要です。
+
+詳細はウェブサイトをご確認ください。"""
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_message)]
+                )
+            )
+
+    elif action == 'cancel_subscription':
+        # サブスクリプション解約（Issue #19対応）
+        with engine.connect() as conn:
+            user_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT id, subscription_status
+                    FROM users
+                    WHERE line_user_id = :line_user_id
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            ).fetchone()
+
+            if not user_data:
+                reply_message = "ユーザー情報が見つかりません。"
+            else:
+                user_id, status = user_data
+
+                if status == 'active':
+                    # 解約確認メッセージを送信
+                    reply_message = {
+                        "type": "bubble",
+                        "body": {
+                            "type": "box",
+                            "layout": "vertical",
+                            "contents": [
+                                {
+                                    "type": "text",
+                                    "text": "⚠️ サブスクリプション解約",
+                                    "weight": "bold",
+                                    "size": "lg",
+                                    "color": "#FF6B6B"
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "本当に解約しますか？",
+                                    "wrap": True,
+                                    "margin": "md"
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "• 現在の契約期間終了後、サービスが利用できなくなります\n• タスク生成などの機能が制限されます",
+                                    "wrap": True,
+                                    "size": "sm",
+                                    "color": "#999999",
+                                    "margin": "md"
+                                }
+                            ]
+                        },
+                        "footer": {
+                            "type": "box",
+                            "layout": "vertical",
+                            "contents": [
+                                {
+                                    "type": "button",
+                                    "action": {
+                                        "type": "postback",
+                                        "label": "解約を確定する",
+                                        "data": "action=confirm_cancel_subscription",
+                                        "displayText": "解約を確定"
+                                    },
+                                    "style": "primary",
+                                    "color": "#FF6B6B"
+                                },
+                                {
+                                    "type": "button",
+                                    "action": {
+                                        "type": "message",
+                                        "label": "キャンセル",
+                                        "text": "設定"
+                                    },
+                                    "style": "link",
+                                    "margin": "sm"
+                                }
+                            ]
+                        }
+                    }
+                else:
+                    reply_message = "現在有効なサブスクリプションがありません。"
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            if isinstance(reply_message, dict):
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[
+                            FlexMessage(
+                                alt_text="サブスクリプション解約確認",
+                                contents=FlexContainer.from_dict(reply_message)
+                            )
+                        ]
+                    )
+                )
+            else:
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_message)]
+                    )
+                )
+
+    elif action == 'confirm_cancel_subscription':
+        # サブスクリプション解約確定（Issue #19対応）
+        with engine.connect() as conn:
+            user_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT id, subscription_end_date
+                    FROM users
+                    WHERE line_user_id = :line_user_id AND subscription_status = 'active'
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            ).fetchone()
+
+            if not user_data:
+                reply_message = "有効なサブスクリプションが見つかりません。"
+            else:
+                user_id, end_date = user_data
+
+                # サブスクリプションステータスを解約に変更
+                conn.execute(
+                    sqlalchemy.text(
+                        """
+                        UPDATE users
+                        SET subscription_status = 'cancelled'
+                        WHERE id = :user_id
+                        """
+                    ),
+                    {"user_id": user_id}
+                )
+                conn.commit()
+
+                end_text = end_date.strftime("%Y年%m月%d日") if end_date else "契約期間終了時"
+
+                reply_message = f"""✅ サブスクリプションを解約しました
+
+{end_text}までサービスをご利用いただけます。
+
+ご利用ありがとうございました。
+またのご利用をお待ちしております。"""
 
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
@@ -2628,6 +2854,49 @@ def get_settings_message(user_id: str, relationship: str, prefecture: str, munic
                             "style": "link",
                             "height": "sm",
                             "margin": "sm"
+                        }
+                    ],
+                    "paddingAll": "12px",
+                    "backgroundColor": "#FAFAFA",
+                    "cornerRadius": "8px",
+                    "margin": "md"
+                },
+                # サブスクリプション管理（Issue #19対応）
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": "💳 サブスクリプション",
+                            "size": "sm",
+                            "color": "#999999",
+                            "weight": "bold"
+                        },
+                        {
+                            "type": "button",
+                            "action": {
+                                "type": "postback",
+                                "label": "ステータスを確認",
+                                "data": "action=view_subscription_status",
+                                "displayText": "サブスクリプションステータスを確認"
+                            },
+                            "style": "link",
+                            "height": "sm",
+                            "margin": "sm"
+                        },
+                        {
+                            "type": "button",
+                            "action": {
+                                "type": "postback",
+                                "label": "解約手続き",
+                                "data": "action=cancel_subscription",
+                                "displayText": "サブスクリプションを解約"
+                            },
+                            "style": "link",
+                            "height": "sm",
+                            "margin": "sm",
+                            "color": "#FF6B6B"
                         }
                     ],
                     "paddingAll": "12px",
