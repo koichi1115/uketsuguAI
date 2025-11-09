@@ -47,6 +47,9 @@ from question_generator import (
 from conversation_flow_manager import ConversationFlowManager, ConversationState
 from task_personalizer import generate_personalized_tasks
 from task_enhancer import enhance_tasks_with_tips, generate_general_tips_task
+from rate_limiter import is_rate_limited
+from subscription_manager import SubscriptionManager
+from plan_controller import PlanController
 
 # 環境変数からGCP設定を取得
 PROJECT_ID = os.environ.get('GCP_PROJECT_ID')
@@ -58,6 +61,8 @@ _configuration = None
 _engine = None
 _connector = None
 _gemini_client = None
+_subscription_manager = None
+_plan_controller = None
 
 
 def get_secret(secret_id: str) -> str:
@@ -154,6 +159,29 @@ def get_gemini_client():
         _gemini_client = genai.Client(api_key=gemini_api_key)
 
     return _gemini_client
+
+
+def get_subscription_manager():
+    """Subscription Managerを取得（遅延初期化）"""
+    global _subscription_manager
+
+    if _subscription_manager is None:
+        engine = get_db_engine()
+        stripe_api_key = get_secret('STRIPE_API_KEY').strip()
+        _subscription_manager = SubscriptionManager(engine, stripe_api_key)
+
+    return _subscription_manager
+
+
+def get_plan_controller():
+    """Plan Controllerを取得（遅延初期化）"""
+    global _plan_controller
+
+    if _plan_controller is None:
+        subscription_manager = get_subscription_manager()
+        _plan_controller = PlanController(subscription_manager)
+
+    return _plan_controller
 
 
 def enqueue_task_generation(user_id: str, line_user_id: str):
@@ -258,11 +286,11 @@ def enqueue_tips_enhancement(user_id: str, line_user_id: str):
 def enqueue_ai_response_generation(user_id: str, line_user_id: str, user_message: str):
     """Cloud TasksにAI応答生成ジョブを投入"""
     client = tasks_v2.CloudTasksClient()
-    # TODO: AI応答用に別のキュー(ai-response-queue)を立てることを推奨
-    queue_name = 'task-generation-queue'
+    # 削除したキュー名は30日間再利用不可のため、v2を使用
+    queue_name = 'task-generation-queue-v2'
     parent = client.queue_path(PROJECT_ID, REGION, queue_name)
 
-    worker_url = f"https://{REGION}-{PROJECT_ID}.cloudfunctions.net/ai_response_worker"
+    worker_url = f"https://{REGION}-{PROJECT_ID}.cloudfunctions.net/ai-response-worker"
 
     payload = json.dumps({
         'user_id': str(user_id),
@@ -302,6 +330,40 @@ def ai_response_worker(request: Request):
             return jsonify({"error": "user_id, line_user_id, and user_message are required"}), 400
 
         print(f"🔄 AI応答生成開始: user_id={user_id}")
+
+        # ユーザーメッセージを会話履歴に保存（非同期処理のため明示的に保存）
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            # 最新の会話履歴をチェック（重複回避）
+            latest_message = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT message, role
+                    FROM conversation_history
+                    WHERE user_id = :user_id
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"user_id": user_id}
+            ).fetchone()
+
+            # 最新メッセージがユーザーメッセージと異なる場合のみ保存
+            if not latest_message or latest_message[0] != user_message or latest_message[1] != 'user':
+                conn.execute(
+                    sqlalchemy.text(
+                        """
+                        INSERT INTO conversation_history (user_id, role, message)
+                        VALUES (:user_id, 'user', :message)
+                        """
+                    ),
+                    {
+                        "user_id": user_id,
+                        "message": user_message
+                    }
+                )
+                conn.commit()
+                print(f"💾 ユーザーメッセージを会話履歴に保存: {user_message[:50]}...")
 
         # AI応答を生成
         ai_reply = generate_ai_response(user_id, user_message)
@@ -673,6 +735,22 @@ def handle_message(event: MessageEvent):
         ).fetchone()
 
     user_id = user_data[0]
+
+    # ⭐ Phase 1: レート制限チェック
+    # ただし、アップグレード関連メッセージと基本コマンドは除外
+    bypass_rate_limit_messages = ['アップグレード', '有料プラン', '課金', 'プラン変更', 'ヘルプ', '設定']
+    if user_message not in bypass_rate_limit_messages:
+        is_limited, limit_message = is_rate_limited(str(user_id), engine)
+        if is_limited:
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=limit_message)]
+                    )
+                )
+            return  # レート制限超過のため処理終了
     relationship = user_data[1]
     prefecture = user_data[2]
     municipality = user_data[3]
@@ -1120,6 +1198,8 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
         return get_help_message()
     elif message == '設定':
         return get_settings_message(user_id, relationship, prefecture, municipality, death_date)
+    elif message in ['アップグレード', '有料プラン', '課金', 'プラン変更']:
+        return handle_upgrade_request(user_id, line_user_id)
 
     # プロフィールが全て揃っている場合
     if relationship and prefecture and municipality and death_date:
@@ -1160,9 +1240,9 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
                     # 「完了1」「1完了」「完了１」「１完了」などのパターンをチェック
                     return complete_task(user_id, message)
                 else:
-                    # AI応答生成を非同期化
+                    # AI応答を非同期で生成（Cloud Tasksキュー経由）
                     enqueue_ai_response_generation(user_id, line_user_id, message)
-                    return "🤖 AIが応答を考えています... しばらくお待ちください。"
+                    return "AIが応答を考えています...\nしばらくお待ちください"
             else:
                 # タスク生成をCloud Tasksに投入（非同期）
                 enqueue_task_generation(user_id, line_user_id)
@@ -1335,7 +1415,7 @@ def get_task_list_message(user_id: str, show_all: bool = False):
                 """
                 SELECT id, title, due_date, status, priority, category, metadata
                 FROM tasks
-                WHERE user_id = :user_id AND is_deleted = false
+                WHERE user_id = :user_id
                 ORDER BY
                     CASE status
                         WHEN 'pending' THEN 1
@@ -1348,8 +1428,43 @@ def get_task_list_message(user_id: str, show_all: bool = False):
             {"user_id": user_id}
         ).fetchall()
 
-    # Flex Messageを返す
-    return create_task_list_flex(tasks, show_all=show_all)
+    # ⭐ Phase 1: プラン制御 - タスクをプランに応じてフィルタリング
+    print(f"📊 Phase 1: タスク数（フィルタリング前）: {len(tasks)}")
+
+    plan_controller = get_plan_controller()
+    tasks_as_dict = [
+        {
+            "id": str(task[0]),
+            "title": task[1],
+            "due_date": task[2],
+            "status": task[3],
+            "priority": task[4],
+            "category": task[5],
+            "metadata": task[6]
+        }
+        for task in tasks
+    ]
+
+    print(f"🔐 Phase 1: プラン制御を実行 (user_id: {user_id})")
+    filtered_tasks_dict = plan_controller.filter_tasks_by_plan(str(user_id), tasks_as_dict)
+    print(f"📊 Phase 1: タスク数（フィルタリング後）: {len(filtered_tasks_dict)}")
+
+    # 辞書形式をタプル形式に戻す（create_task_list_flexがタプルを期待しているため）
+    filtered_tasks = [
+        (
+            task["id"],
+            task["title"],
+            task["due_date"],
+            task["status"],
+            task["priority"],
+            task["category"],
+            task["metadata"]
+        )
+        for task in filtered_tasks_dict
+    ]
+
+    # Flex Messageを返す（フィルタリング済みタスク）
+    return create_task_list_flex(filtered_tasks, show_all=show_all)
 
 
 def complete_task(user_id: str, message: str) -> str:
@@ -1453,7 +1568,7 @@ def generate_ai_response(user_id: str, user_message: str) -> str:
             {"user_id": user_id}
         ).fetchone()
 
-        # 直近の会話履歴を取得（最新10件）
+        # 直近の会話履歴を取得（最新20件 = 約10往復分）
         conversation_history = conn.execute(
             sqlalchemy.text(
                 """
@@ -1461,7 +1576,7 @@ def generate_ai_response(user_id: str, user_message: str) -> str:
                 FROM conversation_history
                 WHERE user_id = :user_id
                 ORDER BY created_at DESC
-                LIMIT 10
+                LIMIT 20
                 """
             ),
             {"user_id": user_id}
@@ -1485,6 +1600,7 @@ def generate_ai_response(user_id: str, user_message: str) -> str:
 - 手続きの期限や必要書類について具体的にアドバイスする
 - 専門的な内容は分かりやすく説明する
 - 個人情報（電話番号、マイナンバー等）の入力は避けるよう注意を促す
+- 会話の文脈を理解して、前の質問の続きにも適切に答える
 
 【回答スタイル】
 - 簡潔で分かりやすく（200文字以内）
@@ -1496,7 +1612,7 @@ def generate_ai_response(user_id: str, user_message: str) -> str:
     # 会話履歴を逆順にして（古い順に）プロンプトに追加
     conversation_context = ""
     for i, (role, msg) in enumerate(reversed(conversation_history)):
-        if i >= 5:  # 直近5件のみ
+        if i >= 10:  # 直近10件のみ（約5往復分）
             break
         if role == "user":
             conversation_context += f"ユーザー: {msg}\n"
@@ -1573,25 +1689,64 @@ def handle_postback(event: PostbackEvent):
     if action == 'view_task_detail':
         task_id = params.get('task_id', '')
 
-        # タスク情報を取得
+        # ユーザーIDを取得
         with engine.connect() as conn:
-            task_data = conn.execute(
+            user_data = conn.execute(
                 sqlalchemy.text(
                     """
-                    SELECT id, title, description, due_date, priority, category, metadata
-                    FROM tasks
-                    WHERE id = :task_id
+                    SELECT u.id
+                    FROM users u
+                    WHERE u.line_user_id = :line_user_id
                     """
                 ),
-                {"task_id": task_id}
+                {"line_user_id": line_user_id}
             ).fetchone()
 
-            if not task_data:
-                reply_message = "タスクが見つかりません。"
+            if not user_data:
+                reply_message = "ユーザー情報が見つかりません。"
             else:
-                # タスク詳細のFlex Messageを生成
-                from flex_messages import create_task_detail_flex
-                reply_message = create_task_detail_flex(task_data)
+                user_id = str(user_data[0])
+
+                # タスク情報を取得
+                task_data = conn.execute(
+                    sqlalchemy.text(
+                        """
+                        SELECT id, title, description, due_date, priority, category, metadata, user_id
+                        FROM tasks
+                        WHERE id = :task_id
+                        """
+                    ),
+                    {"task_id": task_id}
+                ).fetchone()
+
+                if not task_data:
+                    reply_message = "タスクが見つかりません。"
+                elif str(task_data[7]) != user_id:
+                    reply_message = "このタスクにはアクセスできません。"
+                else:
+                    # タスクのインデックスを取得（無料プランの制限チェックに使用）
+                    all_tasks = conn.execute(
+                        sqlalchemy.text(
+                            """
+                            SELECT id
+                            FROM tasks
+                            WHERE user_id = :user_id AND is_deleted = false AND status = 'pending'
+                            ORDER BY due_date ASC
+                            """
+                        ),
+                        {"user_id": user_id}
+                    ).fetchall()
+
+                    task_index = next((i for i, t in enumerate(all_tasks) if str(t[0]) == task_id), -1)
+
+                    # プラン制御のチェック
+                    plan_controller = get_plan_controller()
+                    if not plan_controller.can_access_task_details(user_id, task_index):
+                        reply_message = plan_controller.get_upgrade_message()
+                    else:
+                        # タスク詳細のFlex Messageを生成（user_idフィールドを除外）
+                        from flex_messages import create_task_detail_flex
+                        reply_message = create_task_detail_flex(task_data[:7])
 
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
@@ -2476,6 +2631,135 @@ def tips_enhancement_worker(request: Request):
         return jsonify({"error": str(e)}), 500
 
 
+@functions_framework.http
+def stripe_webhook(request: Request):
+    """
+    Stripe Webhookエンドポイント
+
+    決済完了やサブスクリプションキャンセルなどのイベントを受け取る
+    """
+    try:
+        # Stripe署名検証用のシークレットを取得
+        webhook_secret = get_secret('STRIPE_WEBHOOK_SECRET').strip()
+
+        # リクエストボディと署名を取得
+        payload = request.get_data(as_text=True)
+        sig_header = request.headers.get('Stripe-Signature')
+
+        if not sig_header:
+            print("❌ Stripe署名ヘッダーがありません")
+            return jsonify({"error": "No signature header"}), 400
+
+        # Stripe署名を検証してイベントを構築
+        import stripe
+        try:
+            event = stripe.Webhook.construct_event(
+                payload, sig_header, webhook_secret
+            )
+        except stripe.error.SignatureVerificationError as e:
+            print(f"❌ Stripe署名検証エラー: {str(e)}")
+            return jsonify({"error": "Invalid signature"}), 400
+
+        # イベントタイプに応じて処理
+        event_type = event['type']
+        print(f"📬 Stripe Webhookイベント受信: {event_type}")
+
+        subscription_manager = get_subscription_manager()
+
+        if event_type == 'checkout.session.completed':
+            # 決済完了イベント
+            session = event['data']['object']
+            subscription_manager.handle_checkout_completed(session)
+            print(f"✅ Checkout完了処理: user_id={session['metadata'].get('user_id')}")
+
+        elif event_type == 'customer.subscription.deleted':
+            # サブスクリプションキャンセルイベント
+            subscription = event['data']['object']
+            subscription_manager.handle_subscription_deleted(subscription)
+            print(f"✅ サブスクリプション削除処理: subscription_id={subscription['id']}")
+
+        else:
+            # その他のイベントはログのみ
+            print(f"ℹ️ 未処理のイベントタイプ: {event_type}")
+
+        return jsonify({"status": "success"}), 200
+
+    except Exception as e:
+        print(f"❌ Stripe Webhookエラー: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+def handle_upgrade_request(user_id: str, line_user_id: str):
+    """アップグレードリクエストを処理"""
+    engine = get_db_engine()
+    subscription_manager = get_subscription_manager()
+    plan_controller = get_plan_controller()
+
+    # 現在のプラン状態を確認
+    if subscription_manager.is_premium_user(str(user_id)):
+        # 既に有料プランの場合
+        subscription = subscription_manager.get_user_subscription(str(user_id))
+        return f"""✅ 有料プラン加入中です
+
+現在のプラン: β版プラン（月額500円）
+ステータス: {subscription['status']}
+
+有料プランの特典：
+✅ すべてのタスクを閲覧
+✅ 独自タスクの追加・編集・削除
+✅ リマインダー機能（準備中）
+✅ グループLINE対応（準備中）
+
+プランの管理は「設定」から行えます。"""
+
+    # 無料プランの場合、Stripe Checkoutセッションを作成
+    try:
+        # 決済完了後のリダイレクトURL
+        # Stripeの制約でhttps://が必要なため、一時的にダミーのURLを使用
+        # 実際の本番環境では、専用のランディングページを用意するのが望ましい
+        import urllib.parse
+        base_url = "https://line.me/R/oaMessage/@yourbotid/"
+        success_message = urllib.parse.quote("感謝します！有料プラン登録が完了しました")
+        cancel_message = urllib.parse.quote("キャンセルされました")
+
+        success_url = f"{base_url}?{success_message}"
+        cancel_url = f"{base_url}?{cancel_message}"
+
+        checkout_url = subscription_manager.create_checkout_session(
+            user_id=str(user_id),
+            line_user_id=line_user_id,
+            success_url=success_url,
+            cancel_url=cancel_url
+        )
+
+        return f"""💎 有料プランへのアップグレード
+
+β版プラン: 月額500円（税込）
+
+【特典】
+✅ すべてのタスクを閲覧
+✅ 独自タスクの追加・編集・削除
+✅ リマインダー機能（準備中）
+✅ グループLINE対応（準備中）
+
+以下のリンクから決済画面にアクセスしてください：
+{checkout_url}
+
+※クレジットカード決済（Stripe）を利用します
+※テスト環境では実際の決済は行われません"""
+
+    except Exception as e:
+        print(f"Stripe Checkoutセッション作成エラー: {str(e)}")
+        return """申し訳ございません。現在アップグレード処理に問題が発生しています。
+
+しばらく経ってから再度お試しください。
+問題が続く場合は、お問い合わせください。
+
+📞 お問い合わせ: ko_15_ko_15-m1@yahoo.co.jp"""
+
+
 def get_help_message() -> str:
     """ヘルプメッセージを生成"""
     return """【受け継ぐAI 使い方ガイド】
@@ -2506,6 +2790,74 @@ ko_15_ko_15-m1@yahoo.co.jp
 - 「タスク」でタスク一覧を表示
 - 「全タスク」で完了済み含む全て表示
 - 質問は自由に入力してください"""
+
+
+def get_plan_info_section(user_id: str):
+    """プラン情報セクションを生成"""
+    subscription_manager = get_subscription_manager()
+    plan_controller = get_plan_controller()
+
+    is_premium = subscription_manager.is_premium_user(str(user_id))
+
+    if is_premium:
+        # 有料プランの場合
+        subscription = subscription_manager.get_user_subscription(str(user_id))
+        plan_text = "β版プラン（月額500円）"
+        status_text = "✅ アクティブ"
+        button_label = "プラン管理"
+        button_text = "プラン変更"
+    else:
+        # 無料プランの場合
+        plan_text = "無料プラン"
+        status_text = "⚠️ 2タスクまで閲覧可能"
+        button_label = "アップグレード"
+        button_text = "アップグレード"
+
+    return {
+        "type": "box",
+        "layout": "vertical",
+        "contents": [
+            {
+                "type": "text",
+                "text": "💎 プラン",
+                "size": "sm",
+                "color": "#999999",
+                "weight": "bold"
+            },
+            {
+                "type": "text",
+                "text": plan_text,
+                "size": "md",
+                "color": "#333333",
+                "wrap": True,
+                "margin": "sm"
+            },
+            {
+                "type": "text",
+                "text": status_text,
+                "size": "xs",
+                "color": "#17C964" if is_premium else "#F5A623",
+                "wrap": True,
+                "margin": "xs"
+            },
+            {
+                "type": "button",
+                "action": {
+                    "type": "message",
+                    "label": button_label,
+                    "text": button_text
+                },
+                "style": "primary" if not is_premium else "link",
+                "color": "#17C964" if not is_premium else None,
+                "height": "sm",
+                "margin": "md"
+            }
+        ],
+        "paddingAll": "12px",
+        "backgroundColor": "#FAFAFA",
+        "cornerRadius": "8px",
+        "margin": "md"
+    }
 
 
 def get_settings_message(user_id: str, relationship: str, prefecture: str, municipality: str, death_date):
@@ -2647,6 +2999,8 @@ def get_settings_message(user_id: str, relationship: str, prefecture: str, munic
                     "cornerRadius": "8px",
                     "margin": "md"
                 },
+                # プラン情報を追加
+                get_plan_info_section(user_id),
                 # 注意書き
                 {
                     "type": "box",
