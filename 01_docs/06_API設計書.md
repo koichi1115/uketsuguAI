@@ -25,6 +25,9 @@
 |---------|---------------|------|------|
 | POST | /webhook | LINE Webhook受信 | LINE署名 |
 | POST | /stripe/webhook | Stripe Webhook受信 | Stripe署名 |
+| POST | /pay-it-forward/payment | 恩送り支払い | LINE User ID |
+| GET | /pay-it-forward/stats | 恩送り統計取得 | なし |
+| GET | /pay-it-forward/message | 恩送りメッセージ取得 | なし |
 
 ### 2.2 内部API（Cloud Functions間）
 
@@ -413,11 +416,41 @@ Stripe-Signature: t=1234567890,v1=xxxxx,v0=xxxxx
 
 #### 3.4.4 処理対象イベント
 
+**サブスクリプション関連**（廃止予定）:
 - `customer.subscription.created`: サブスクリプション作成
 - `customer.subscription.updated`: サブスクリプション更新
 - `customer.subscription.deleted`: サブスクリプション解約
 - `invoice.payment_succeeded`: 支払い成功
 - `invoice.payment_failed`: 支払い失敗
+
+**恩送り支払い関連**:
+- `checkout.session.completed`: Checkout セッション完了
+  - 恩送り支払いの決済完了を処理
+  - pay_it_forward_paymentsテーブルのstatusをcompletedに更新
+  - stripe_payment_idを記録
+  - pay_it_forward_statsテーブルを更新（total_payments_count, total_amount）
+
+**Body**（例: checkout.session.completed）:
+```json
+{
+  "id": "evt_1234567890",
+  "object": "event",
+  "type": "checkout.session.completed",
+  "data": {
+    "object": {
+      "id": "cs_test_xxxxx",
+      "object": "checkout.session",
+      "payment_status": "paid",
+      "amount_total": 1000,
+      "currency": "jpy",
+      "metadata": {
+        "payment_id": "660e8400-e29b-41d4-a716-446655440001",
+        "payment_type": "pay_it_forward"
+      }
+    }
+  }
+}
+```
 
 ---
 
@@ -485,6 +518,231 @@ Authorization: Bearer <Cloud Functions ID Token>
 
 ---
 
+### 3.6 恩送り支払いAPI
+
+#### 3.6.1 基本情報
+
+- **エンドポイント**: `POST /pay-it-forward/payment`
+- **URL**: `https://asia-northeast1-uketsuguai-prod.cloudfunctions.net/pay-it-forward-payment`
+- **認証**: LINE User ID（リクエストボディに含む）
+- **タイムアウト**: 30秒
+
+#### 3.6.2 リクエスト
+
+**Headers**:
+```
+Content-Type: application/json
+```
+
+**Body**:
+```json
+{
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "line_user_id": "U1234567890abcdef",
+  "payment_type": "high_priority_completion",
+  "amount": 1000,
+  "message": "このサービスのおかげで、大変な時期を乗り越えることができました。次の方にも同じ支援が届きますように。"
+}
+```
+
+**パラメータ**:
+- `user_id` (required): ユーザーID（UUID）
+- `line_user_id` (required): LINE User ID
+- `payment_type` (required): 支払いタイプ
+  - `high_priority_completion`: 優先度高タスク完了時
+  - `all_tasks_completion`: 全タスク完了時
+- `amount` (required): 支払い金額（500/1000/3000円）
+- `message` (optional): 次のユーザーへのメッセージ（最大200文字）
+
+#### 3.6.3 レスポンス
+
+**成功時（200 OK）**:
+```json
+{
+  "status": "success",
+  "data": {
+    "payment_id": "660e8400-e29b-41d4-a716-446655440001",
+    "stripe_session_url": "https://checkout.stripe.com/pay/cs_test_xxxxx",
+    "amount": 1000,
+    "message_saved": true
+  }
+}
+```
+
+**エラー時（400 Bad Request）**:
+```json
+{
+  "error": {
+    "code": "INVALID_AMOUNT",
+    "message": "Amount must be 500, 1000, or 3000 yen",
+    "details": "Provided amount: 1500"
+  }
+}
+```
+
+**エラー時（400 Bad Request - メッセージ長超過）**:
+```json
+{
+  "error": {
+    "code": "MESSAGE_TOO_LONG",
+    "message": "Message exceeds maximum length of 200 characters",
+    "details": "Current length: 250"
+  }
+}
+```
+
+#### 3.6.4 処理フロー
+
+1. リクエストバリデーション（金額、メッセージ長）
+2. pay_it_forward_paymentsテーブルにレコード作成（status: pending）
+3. メッセージが提供された場合、pay_it_forward_messagesテーブルにレコード作成
+4. Stripe Checkout Sessionを作成
+5. セッションURLを返す
+6. ユーザーがStripeで決済完了後、Stripe Webhookでステータスをcompletedに更新
+7. 統計情報（pay_it_forward_stats）を更新
+
+---
+
+### 3.7 恩送り統計取得API
+
+#### 3.7.1 基本情報
+
+- **エンドポイント**: `GET /pay-it-forward/stats`
+- **URL**: `https://asia-northeast1-uketsuguai-prod.cloudfunctions.net/pay-it-forward-stats`
+- **認証**: なし（公開エンドポイント）
+- **タイムアウト**: 10秒
+
+#### 3.7.2 リクエスト
+
+**Headers**:
+```
+Content-Type: application/json
+```
+
+**Query Parameters**: なし
+
+#### 3.7.3 レスポンス
+
+**成功時（200 OK）**:
+```json
+{
+  "status": "success",
+  "data": {
+    "total_payments_count": 156,
+    "total_amount": 178000,
+    "new_users_count": 142,
+    "coverage_ratio": 1.10,
+    "is_fully_covered": true,
+    "average_payment": 1141,
+    "last_updated_at": "2024-01-20T15:30:00Z"
+  }
+}
+```
+
+**レスポンスフィールド**:
+- `total_payments_count`: 累計恩送り人数
+- `total_amount`: 累計恩送り金額（円）
+- `new_users_count`: 累計新規ユーザー数
+- `coverage_ratio`: カバー率（恩送り人数 ÷ 新規ユーザー数）
+- `is_fully_covered`: 恩送り人数 > 新規ユーザー数の判定
+- `average_payment`: 平均支払い額（円）
+- `last_updated_at`: 最終更新日時
+
+**エラー時（500 Internal Server Error）**:
+```json
+{
+  "error": {
+    "code": "DATABASE_ERROR",
+    "message": "Failed to retrieve statistics"
+  }
+}
+```
+
+#### 3.7.4 処理フロー
+
+1. pay_it_forward_statsテーブルから統計情報を取得
+2. カバー率、平均支払い額を計算
+3. 統計情報を返す
+
+---
+
+### 3.8 恩送りメッセージ取得API
+
+#### 3.8.1 基本情報
+
+- **エンドポイント**: `GET /pay-it-forward/message`
+- **URL**: `https://asia-northeast1-uketsuguai-prod.cloudfunctions.net/pay-it-forward-message`
+- **認証**: なし（公開エンドポイント）
+- **タイムアウト**: 10秒
+
+#### 3.8.2 リクエスト
+
+**Headers**:
+```
+Content-Type: application/json
+```
+
+**Query Parameters**:
+- `user_id` (required): メッセージを表示する新規ユーザーのID（UUID）
+
+**例**:
+```
+GET /pay-it-forward/message?user_id=550e8400-e29b-41d4-a716-446655440000
+```
+
+#### 3.8.3 レスポンス
+
+**成功時（200 OK）**:
+```json
+{
+  "status": "success",
+  "data": {
+    "message": "このサービスのおかげで、大変な時期を乗り越えることができました。次の方にも同じ支援が届きますように。",
+    "message_id": "770e8400-e29b-41d4-a716-446655440002",
+    "created_at": "2024-01-18T10:15:00Z"
+  }
+}
+```
+
+**成功時（メッセージなし）**:
+```json
+{
+  "status": "success",
+  "data": {
+    "message": null,
+    "message_id": null,
+    "created_at": null
+  }
+}
+```
+
+**エラー時（400 Bad Request）**:
+```json
+{
+  "error": {
+    "code": "INVALID_USER_ID",
+    "message": "Invalid or missing user_id parameter"
+  }
+}
+```
+
+#### 3.8.4 処理フロー
+
+1. リクエストパラメータのバリデーション（user_id）
+2. pay_it_forward_messagesテーブルから未表示のメッセージをランダムに1件取得
+   - WHERE is_displayed = false
+   - ORDER BY RANDOM()
+   - LIMIT 1
+3. メッセージが存在する場合:
+   - is_displayedをtrueに更新
+   - displayed_to_user_idにuser_idを設定
+   - displayed_atに現在時刻を設定
+   - メッセージ内容を返す
+4. メッセージが存在しない場合:
+   - nullを返す
+
+---
+
 ## 4. 共通仕様
 
 ### 4.1 エラーレスポンス
@@ -506,6 +764,9 @@ Authorization: Bearer <Cloud Functions ID Token>
 |-------|--------------|------|
 | INVALID_SIGNATURE | 400 | 署名検証失敗 |
 | INVALID_REQUEST | 400 | リクエスト形式エラー |
+| INVALID_AMOUNT | 400 | 無効な金額（500/1000/3000円以外） |
+| MESSAGE_TOO_LONG | 400 | メッセージが200文字を超過 |
+| INVALID_USER_ID | 400 | 無効なユーザーID |
 | PERSONAL_INFO_DETECTED | 400 | 個人情報が検出された |
 | UNAUTHORIZED | 401 | 認証エラー |
 | FORBIDDEN | 403 | アクセス権限なし |
@@ -515,6 +776,7 @@ Authorization: Bearer <Cloud Functions ID Token>
 | TASK_GENERATION_FAILED | 500 | タスク生成失敗 |
 | AI_RESPONSE_FAILED | 500 | AI応答生成失敗 |
 | DATABASE_ERROR | 500 | データベースエラー |
+| PAYMENT_PROCESSING_FAILED | 500 | 支払い処理失敗 |
 | EXTERNAL_API_ERROR | 502 | 外部API呼び出しエラー |
 | TIMEOUT | 504 | タイムアウト |
 
@@ -982,7 +1244,8 @@ def detect_personal_info(text: str) -> str | None:
 | バージョン | 日付 | 変更内容 | 変更者 |
 |---------|------|---------|--------|
 | 1.0 | 2025-10-05 | 初版作成 | - |
+| 1.1 | 2025-11-09 | 恩送り（Pay It Forward）機能のAPI追加（支払い、統計取得、メッセージ取得）、Stripe Webhook恩送り対応追加、エラーコード追加 | - |
 
 ---
 作成日: 2025-10-05
-最終更新: 2025-10-05
+最終更新: 2025-11-09
