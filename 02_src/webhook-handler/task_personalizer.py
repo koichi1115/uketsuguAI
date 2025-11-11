@@ -13,6 +13,7 @@ import json
 from google import genai
 from google.genai import types
 from google.cloud import secretmanager
+from privacy_utils import anonymize_profile_for_ai
 
 
 PROJECT_ID = os.environ.get('GCP_PROJECT', 'uketsuguai-dev')
@@ -56,6 +57,10 @@ def generate_personalized_tasks(
     # 死亡日をdatetimeに変換
     if isinstance(death_date, str):
         death_date = datetime.fromisoformat(death_date)
+
+    # プライバシー保護：AIに送信する情報を匿名化
+    print("🔒 プライバシー保護: プロファイル情報を匿名化中...")
+    anonymized_profile = anonymize_profile_for_ai(basic_profile)
 
     # Gemini APIクライアントを初期化
     gemini_api_key = get_secret('GEMINI_API_KEY')
