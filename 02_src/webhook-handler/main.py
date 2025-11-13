@@ -51,6 +51,7 @@ from rate_limiter import is_rate_limited
 from subscription_manager import SubscriptionManager
 from plan_controller import PlanController
 from auth_utils import verify_user_ownership, AuthorizationError
+from pay_it_forward_manager import get_pay_it_forward_manager
 
 # 環境変数からGCP設定を取得
 PROJECT_ID = os.environ.get('GCP_PROJECT_ID')
@@ -680,6 +681,8 @@ def handle_follow(event: FollowEvent):
         profile = line_bot_api.get_profile(line_user_id)
 
     # データベースにユーザー登録
+    user_id = None
+    is_new_user = False
     with engine.connect() as conn:
         # 既存ユーザーチェック
         result = conn.execute(
@@ -691,11 +694,13 @@ def handle_follow(event: FollowEvent):
 
         if not result:
             # 新規ユーザー登録
-            conn.execute(
+            is_new_user = True
+            result = conn.execute(
                 sqlalchemy.text(
                     """
                     INSERT INTO users (line_user_id, display_name, status, last_login_at)
                     VALUES (:line_user_id, :display_name, 'active', :last_login_at)
+                    RETURNING id
                     """
                 ),
                 {
@@ -703,14 +708,31 @@ def handle_follow(event: FollowEvent):
                     "display_name": profile.display_name,
                     "last_login_at": datetime.now(timezone.utc)
                 }
-            )
+            ).fetchone()
+            user_id = str(result[0])
             conn.commit()
+        else:
+            user_id = str(result[0])
 
-    # ウェルカムメッセージ
-    welcome_message = f"""はじめまして、{profile.display_name}さん。
+    # ウェルカムメッセージ（Pay It Forward機能統合）
+    if is_new_user:
+        # 新規ユーザーにはPay It Forwardメッセージを表示
+        pif_manager = get_pay_it_forward_manager(engine)
+        pif_welcome = pif_manager.get_welcome_message(user_id)
+
+        welcome_message = f"""はじめまして、{profile.display_name}さん。
+
+{pif_welcome}
+
+---
 
 受け継ぐAIです。
 大切な方を亡くされた後の手続きをサポートします。
+
+まず、あなたと故人の関係を選択してください。"""
+    else:
+        # 既存ユーザーの場合は通常メッセージ
+        welcome_message = f"""おかえりなさい、{profile.display_name}さん。
 
 まず、あなたと故人の関係を選択してください。"""
 
