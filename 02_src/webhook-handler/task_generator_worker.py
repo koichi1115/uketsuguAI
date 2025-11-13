@@ -127,7 +127,8 @@ def generate_tasks_worker(request: Request):
 
         # タスク生成（この処理に5分程度かかる）
         print(f"🔍 AI駆動型タスク生成中...")
-        tasks = generate_basic_tasks(user_id, profile, engine.connect())
+        with engine.connect() as conn:
+            tasks = generate_basic_tasks(user_id, profile, conn)
 
         print(f"✅ タスク生成完了: {len(tasks)}件")
 

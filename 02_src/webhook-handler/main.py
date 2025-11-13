@@ -50,10 +50,15 @@ from task_enhancer import enhance_tasks_with_tips, generate_general_tips_task
 from rate_limiter import is_rate_limited
 from subscription_manager import SubscriptionManager
 from plan_controller import PlanController
+from auth_utils import verify_user_ownership, AuthorizationError
 
 # 環境変数からGCP設定を取得
 PROJECT_ID = os.environ.get('GCP_PROJECT_ID')
 REGION = os.environ.get('GCP_REGION', 'asia-northeast1')
+SERVICE_ACCOUNT_EMAIL = os.environ.get(
+    'SERVICE_ACCOUNT_EMAIL',
+    f'webhook-handler@{PROJECT_ID}.iam.gserviceaccount.com'
+)
 
 # グローバル変数（遅延初期化）
 _handler = None
@@ -66,11 +71,33 @@ _plan_controller = None
 
 
 def get_secret(secret_id: str) -> str:
-    """Secret Managerからシークレットを取得"""
-    client = secretmanager.SecretManagerServiceClient()
-    name = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest"
-    response = client.access_secret_version(request={"name": name})
-    return response.payload.data.decode("UTF-8")
+    """
+    Secret Managerからシークレットを取得
+
+    Args:
+        secret_id: シークレットID
+
+    Returns:
+        シークレット値
+
+    Raises:
+        Exception: シークレット取得に失敗した場合
+    """
+    try:
+        client = secretmanager.SecretManagerServiceClient()
+        name = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest"
+        response = client.access_secret_version(request={"name": name})
+        secret_value = response.payload.data.decode("UTF-8")
+
+        # ログにシークレット値を出力しない（セキュリティ対策）
+        print(f"✅ シークレット取得成功: {secret_id}")
+        return secret_value
+
+    except Exception as e:
+        # エラー詳細をログに記録（シークレット値は含めない）
+        print(f"❌ シークレット取得エラー: secret_id={secret_id}, error={type(e).__name__}")
+        # 本番環境では適切なエラーハンドリングを実装
+        raise Exception(f"Failed to retrieve secret: {secret_id}") from e
 
 
 def validate_signature(body: str, signature: str, channel_secret: str) -> bool:
@@ -141,10 +168,15 @@ def get_db_engine():
             )
             return conn
 
-        # SQLAlchemy エンジン
+        # SQLAlchemy エンジン（接続プール設定を追加）
         _engine = sqlalchemy.create_engine(
             "postgresql+pg8000://",
             creator=get_db_connection,
+            pool_size=5,           # 同時接続数の上限
+            max_overflow=10,       # pool_sizeを超えた場合の追加接続数
+            pool_timeout=30,       # 接続取得のタイムアウト（秒）
+            pool_recycle=1800,     # 接続の再利用期限（30分）
+            pool_pre_ping=True,    # 接続の有効性を事前確認
         )
 
     return _engine
@@ -215,7 +247,7 @@ def enqueue_task_generation(user_id: str, line_user_id: str):
             'headers': {'Content-Type': 'application/json'},
             'body': payload,
             'oidc_token': {
-                'service_account_email': 'webhook-handler@uketsuguai-dev.iam.gserviceaccount.com'
+                'service_account_email': SERVICE_ACCOUNT_EMAIL
             }
         }
     }
@@ -245,7 +277,7 @@ def enqueue_personalized_task_generation(user_id: str, line_user_id: str):
             'headers': {'Content-Type': 'application/json'},
             'body': payload,
             'oidc_token': {
-                'service_account_email': 'webhook-handler@uketsuguai-dev.iam.gserviceaccount.com'
+                'service_account_email': SERVICE_ACCOUNT_EMAIL
             }
         }
     }
@@ -274,7 +306,7 @@ def enqueue_tips_enhancement(user_id: str, line_user_id: str):
             'headers': {'Content-Type': 'application/json'},
             'body': payload,
             'oidc_token': {
-                'service_account_email': 'webhook-handler@uketsuguai-dev.iam.gserviceaccount.com'
+                'service_account_email': SERVICE_ACCOUNT_EMAIL
             }
         }
     }
@@ -428,10 +460,18 @@ def generate_tasks_worker(request: Request):
         if not line_user_id:
             return jsonify({"error": "line_user_id is required"}), 400
 
-        print(f"🔄 Step 1: 基本タスク生成開始: user_id={user_id}")
-
         # データベース接続
         engine = get_db_engine()
+
+        # ユーザー所有権検証
+        with engine.connect() as conn:
+            try:
+                verify_user_ownership(conn, line_user_id, user_id)
+            except AuthorizationError as e:
+                print(f"❌ 認可エラー: {e}")
+                return jsonify({"error": "Unauthorized access"}), 403
+
+        print(f"🔄 Step 1: 基本タスク生成開始: user_id={user_id}")
 
         # 会話フロー管理初期化
         with engine.connect() as conn:
@@ -1148,11 +1188,15 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
             import json
             memo_text = message.strip()
 
-            if memo_text:
+            # メモ削除キーワードのチェック（Issue #16対応）
+            delete_keywords = ['削除', 'なし', 'クリア', '消す', 'delete', 'clear', 'none']
+            is_delete = memo_text.lower() in delete_keywords
+
+            if memo_text and not is_delete:
                 # メモがある場合は保存
                 metadata = json.dumps({"memo": memo_text})
             else:
-                # 空白の場合はメモを削除
+                # 削除キーワードまたは空白の場合はメモを削除
                 metadata = json.dumps({"memo": ""})
 
             conn.execute(
@@ -1160,10 +1204,10 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
                     """
                     UPDATE tasks
                     SET metadata = CAST(:metadata AS jsonb)
-                    WHERE id = :task_id
+                    WHERE id = :task_id AND user_id = :user_id
                     """
                 ),
-                {"task_id": task_id, "metadata": metadata}
+                {"task_id": task_id, "user_id": user_id, "metadata": metadata}
             )
             conn.commit()
 
@@ -1173,15 +1217,15 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
                     """
                     SELECT id, title, description, due_date, priority, category, metadata
                     FROM tasks
-                    WHERE id = :task_id
+                    WHERE id = :task_id AND user_id = :user_id
                     """
                 ),
-                {"task_id": task_id}
+                {"task_id": task_id, "user_id": user_id}
             ).fetchone()
 
             if task_data:
                 from flex_messages import create_task_detail_flex
-                success_message = "✅ メモを保存しました" if memo_text else "✅ メモを削除しました"
+                success_message = "✅ メモを保存しました" if (memo_text and not is_delete) else "✅ メモを削除しました"
                 return [
                     success_message,
                     {
@@ -1525,10 +1569,10 @@ def complete_task(user_id: str, message: str) -> str:
                 """
                 UPDATE tasks
                 SET status = 'completed'
-                WHERE id = :task_id
+                WHERE id = :task_id AND user_id = :user_id
                 """
             ),
-            {"task_id": task_id}
+            {"task_id": task_id, "user_id": user_id}
         )
 
         # task_progressに記録
@@ -1682,6 +1726,27 @@ def handle_postback(event: PostbackEvent):
     configuration = get_configuration()
     engine = get_db_engine()
 
+    # line_user_idからuser_idを取得（認証）
+    with engine.connect() as conn:
+        user_result = conn.execute(
+            sqlalchemy.text("SELECT id FROM users WHERE line_user_id = :line_user_id"),
+            {"line_user_id": line_user_id}
+        ).fetchone()
+
+        if not user_result:
+            # ユーザーが見つからない場合はエラー
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text="ユーザー情報が見つかりません。")]
+                    )
+                )
+            return
+
+        user_id = user_result[0]
+
     # ポストバックデータをパース
     params = dict(param.split('=') for param in postback_data.split('&'))
     action = params.get('action', '')
@@ -1689,7 +1754,7 @@ def handle_postback(event: PostbackEvent):
     if action == 'view_task_detail':
         task_id = params.get('task_id', '')
 
-        # ユーザーIDを取得
+        # ユーザーIDを取得し、タスク情報を検証付きで取得
         with engine.connect() as conn:
             user_data = conn.execute(
                 sqlalchemy.text(
@@ -1707,22 +1772,20 @@ def handle_postback(event: PostbackEvent):
             else:
                 user_id = str(user_data[0])
 
-                # タスク情報を取得
+                # タスク情報を取得(user_id検証付き)
                 task_data = conn.execute(
                     sqlalchemy.text(
                         """
                         SELECT id, title, description, due_date, priority, category, metadata, user_id
                         FROM tasks
-                        WHERE id = :task_id
+                        WHERE id = :task_id AND user_id = :user_id
                         """
                     ),
-                    {"task_id": task_id}
+                    {"task_id": task_id, "user_id": user_id}
                 ).fetchone()
 
                 if not task_data:
                     reply_message = "タスクが見つかりません。"
-                elif str(task_data[7]) != user_id:
-                    reply_message = "このタスクにはアクセスできません。"
                 else:
                     # タスクのインデックスを取得（無料プランの制限チェックに使用）
                     all_tasks = conn.execute(
@@ -1811,10 +1874,10 @@ def handle_postback(event: PostbackEvent):
                             """
                             UPDATE tasks
                             SET status = 'completed'
-                            WHERE id = :task_id
+                            WHERE id = :task_id AND user_id = :user_id
                             """
                         ),
-                        {"task_id": task_id}
+                        {"task_id": task_id, "user_id": user_id}
                     )
 
                     # task_progressに記録
@@ -1899,10 +1962,10 @@ def handle_postback(event: PostbackEvent):
                             """
                             UPDATE tasks
                             SET status = 'pending'
-                            WHERE id = :task_id
+                            WHERE id = :task_id AND user_id = :user_id
                             """
                         ),
-                        {"task_id": task_id}
+                        {"task_id": task_id, "user_id": user_id}
                     )
 
                     # task_progressに記録
@@ -2363,7 +2426,7 @@ def handle_postback(event: PostbackEvent):
                 )
                 conn.commit()
 
-                reply_message = "メモを入力してください。\n\n空白のメッセージを送信するとメモが削除されます。"
+                reply_message = "メモを入力してください。\n\nメモを削除する場合は「削除」と送信してください。"
             else:
                 reply_message = "ユーザー情報が見つかりません。"
 
@@ -2420,6 +2483,228 @@ def handle_postback(event: PostbackEvent):
                 )
             )
 
+    elif action == 'view_subscription_status':
+        # サブスクリプションステータスの確認（Issue #19対応）
+        with engine.connect() as conn:
+            user_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT id, subscription_status, subscription_plan, subscription_start_date, subscription_end_date
+                    FROM users
+                    WHERE line_user_id = :line_user_id
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            ).fetchone()
+
+            if not user_data:
+                reply_message = "ユーザー情報が見つかりません。"
+            else:
+                user_id, status, plan, start_date, end_date = user_data
+
+                # サブスクリプションステータスに応じたメッセージを生成
+                if status == 'active':
+                    status_emoji = "✅"
+                    status_text = "有効"
+                    plan_text = plan or "スタンダードプラン"
+                    start_text = start_date.strftime("%Y年%m月%d日") if start_date else "不明"
+                    end_text = end_date.strftime("%Y年%m月%d日") if end_date else "継続中"
+
+                    reply_message = f"""{status_emoji} サブスクリプションステータス
+
+【現在の状態】
+ステータス: {status_text}
+プラン: {plan_text}
+開始日: {start_text}
+次回更新日: {end_text}
+
+サブスクリプションは正常に継続されています。"""
+
+                elif status == 'cancelled':
+                    status_emoji = "⚠️"
+                    status_text = "解約済み"
+                    end_text = end_date.strftime("%Y年%m月%d日") if end_date else "不明"
+
+                    reply_message = f"""{status_emoji} サブスクリプションステータス
+
+【現在の状態】
+ステータス: {status_text}
+利用可能期限: {end_text}
+
+サブスクリプションは解約されています。
+期限まではサービスをご利用いただけます。"""
+
+                else:
+                    # 未契約またはその他の状態
+                    reply_message = """💡 サブスクリプション未契約
+
+現在サブスクリプションに未登録です。
+プレミアム機能をご利用いただくには、サブスクリプションへの登録が必要です。
+
+詳細はウェブサイトをご確認ください。"""
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_message)]
+                )
+            )
+
+    elif action == 'cancel_subscription':
+        # サブスクリプション解約（Issue #19対応）
+        with engine.connect() as conn:
+            user_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT id, subscription_status
+                    FROM users
+                    WHERE line_user_id = :line_user_id
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            ).fetchone()
+
+            if not user_data:
+                reply_message = "ユーザー情報が見つかりません。"
+            else:
+                user_id, status = user_data
+
+                if status == 'active':
+                    # 解約確認メッセージを送信
+                    reply_message = {
+                        "type": "bubble",
+                        "body": {
+                            "type": "box",
+                            "layout": "vertical",
+                            "contents": [
+                                {
+                                    "type": "text",
+                                    "text": "⚠️ サブスクリプション解約",
+                                    "weight": "bold",
+                                    "size": "lg",
+                                    "color": "#FF6B6B"
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "本当に解約しますか？",
+                                    "wrap": True,
+                                    "margin": "md"
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "• 現在の契約期間終了後、サービスが利用できなくなります\n• タスク生成などの機能が制限されます",
+                                    "wrap": True,
+                                    "size": "sm",
+                                    "color": "#999999",
+                                    "margin": "md"
+                                }
+                            ]
+                        },
+                        "footer": {
+                            "type": "box",
+                            "layout": "vertical",
+                            "contents": [
+                                {
+                                    "type": "button",
+                                    "action": {
+                                        "type": "postback",
+                                        "label": "解約を確定する",
+                                        "data": "action=confirm_cancel_subscription",
+                                        "displayText": "解約を確定"
+                                    },
+                                    "style": "primary",
+                                    "color": "#FF6B6B"
+                                },
+                                {
+                                    "type": "button",
+                                    "action": {
+                                        "type": "message",
+                                        "label": "キャンセル",
+                                        "text": "設定"
+                                    },
+                                    "style": "link",
+                                    "margin": "sm"
+                                }
+                            ]
+                        }
+                    }
+                else:
+                    reply_message = "現在有効なサブスクリプションがありません。"
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            if isinstance(reply_message, dict):
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[
+                            FlexMessage(
+                                alt_text="サブスクリプション解約確認",
+                                contents=FlexContainer.from_dict(reply_message)
+                            )
+                        ]
+                    )
+                )
+            else:
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_message)]
+                    )
+                )
+
+    elif action == 'confirm_cancel_subscription':
+        # サブスクリプション解約確定（Issue #19対応）
+        with engine.connect() as conn:
+            user_data = conn.execute(
+                sqlalchemy.text(
+                    """
+                    SELECT id, subscription_end_date
+                    FROM users
+                    WHERE line_user_id = :line_user_id AND subscription_status = 'active'
+                    """
+                ),
+                {"line_user_id": line_user_id}
+            ).fetchone()
+
+            if not user_data:
+                reply_message = "有効なサブスクリプションが見つかりません。"
+            else:
+                user_id, end_date = user_data
+
+                # サブスクリプションステータスを解約に変更
+                conn.execute(
+                    sqlalchemy.text(
+                        """
+                        UPDATE users
+                        SET subscription_status = 'cancelled'
+                        WHERE id = :user_id
+                        """
+                    ),
+                    {"user_id": user_id}
+                )
+                conn.commit()
+
+                end_text = end_date.strftime("%Y年%m月%d日") if end_date else "契約期間終了時"
+
+                reply_message = f"""✅ サブスクリプションを解約しました
+
+{end_text}までサービスをご利用いただけます。
+
+ご利用ありがとうございました。
+またのご利用をお待ちしております。"""
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_message)]
+                )
+            )
+
     else:
         # 未知のアクション
         with ApiClient(configuration) as api_client:
@@ -2451,9 +2736,17 @@ def personalized_tasks_worker(request: Request):
         if not user_id or not line_user_id:
             return jsonify({"error": "user_id and line_user_id are required"}), 400
 
-        print(f"🔄 Step 2: 個別タスク生成開始: user_id={user_id}")
-
         engine = get_db_engine()
+
+        # ユーザー所有権検証
+        with engine.connect() as conn:
+            try:
+                verify_user_ownership(conn, line_user_id, user_id)
+            except AuthorizationError as e:
+                print(f"❌ 認可エラー: {e}")
+                return jsonify({"error": "Unauthorized access"}), 403
+
+        print(f"🔄 Step 2: 個別タスク生成開始: user_id={user_id}")
 
         # Step 2開始をマーク
         with engine.connect() as conn:
@@ -2555,9 +2848,17 @@ def tips_enhancement_worker(request: Request):
         if not user_id or not line_user_id:
             return jsonify({"error": "user_id and line_user_id are required"}), 400
 
-        print(f"🔄 Step 3: Tips収集開始: user_id={user_id}")
-
         engine = get_db_engine()
+
+        # ユーザー所有権検証
+        with engine.connect() as conn:
+            try:
+                verify_user_ownership(conn, line_user_id, user_id)
+            except AuthorizationError as e:
+                print(f"❌ 認可エラー: {e}")
+                return jsonify({"error": "Unauthorized access"}), 403
+
+        print(f"🔄 Step 3: Tips収集開始: user_id={user_id}")
 
         # Step 3開始をマーク
         with engine.connect() as conn:
@@ -3001,6 +3302,49 @@ def get_settings_message(user_id: str, relationship: str, prefecture: str, munic
                 },
                 # プラン情報を追加
                 get_plan_info_section(user_id),
+                # サブスクリプション管理（Issue #19対応）
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": "💳 サブスクリプション",
+                            "size": "sm",
+                            "color": "#999999",
+                            "weight": "bold"
+                        },
+                        {
+                            "type": "button",
+                            "action": {
+                                "type": "postback",
+                                "label": "ステータスを確認",
+                                "data": "action=view_subscription_status",
+                                "displayText": "サブスクリプションステータスを確認"
+                            },
+                            "style": "link",
+                            "height": "sm",
+                            "margin": "sm"
+                        },
+                        {
+                            "type": "button",
+                            "action": {
+                                "type": "postback",
+                                "label": "解約手続き",
+                                "data": "action=cancel_subscription",
+                                "displayText": "サブスクリプションを解約"
+                            },
+                            "style": "link",
+                            "height": "sm",
+                            "margin": "sm",
+                            "color": "#FF6B6B"
+                        }
+                    ],
+                    "paddingAll": "12px",
+                    "backgroundColor": "#FAFAFA",
+                    "cornerRadius": "8px",
+                    "margin": "md"
+                },
                 # 注意書き
                 {
                     "type": "box",

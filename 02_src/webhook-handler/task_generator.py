@@ -13,6 +13,7 @@ import json
 from google import genai
 from google.genai import types
 from google.cloud import secretmanager
+from privacy_utils import anonymize_profile_for_ai
 
 
 PROJECT_ID = os.environ.get('GCP_PROJECT', 'uketsuguai-dev')
@@ -54,6 +55,10 @@ def generate_basic_tasks(user_id: str, profile: Dict, conn) -> List[Dict]:
     # 死亡日をdatetimeに変換
     if isinstance(death_date, str):
         death_date = datetime.fromisoformat(death_date)
+
+    # プライバシー保護：AIに送信する情報を匿名化
+    print("🔒 プライバシー保護: プロファイル情報を匿名化中...")
+    anonymized_profile = anonymize_profile_for_ai(profile)
 
     # Gemini APIクライアントを初期化
     gemini_api_key = get_secret('GEMINI_API_KEY')
@@ -122,22 +127,28 @@ def generate_basic_tasks(user_id: str, profile: Dict, conn) -> List[Dict]:
         # 2段階アプローチ: グラウンディングとJSON Schemaは同時使用不可のため
         # 第1段階: Google Search Groundingで情報収集
         # 第2段階: 収集した情報をJSON Schemaで構造化
-        prompt = f"""あなたは死後手続きの専門家です。Google検索を活用して、以下のユーザー情報に基づき、最新かつ完全にパーソナライズされた手続きタスクを生成してください。
 
-【ユーザー情報】
-- 故人との関係: {relationship}
-- お住まい: {prefecture} {municipality}
-- 死亡日: {death_date.strftime('%Y年%m月%d日')}
+        # プライバシー保護された情報を使用
+        generalized_relationship = anonymized_profile.get('relationship', '遺族')
+        region = anonymized_profile.get('region', '日本')
+        time_since_death = anonymized_profile.get('time_since_death', '不明')
+
+        prompt = f"""あなたは死後手続きの専門家です。Google検索を活用して、以下のユーザー情報に基づき、最新かつパーソナライズされた手続きタスクを生成してください。
+
+【ユーザー情報】（プライバシー保護のため一般化）
+- 故人との関係: {generalized_relationship}
+- 地域: {region}地方
+- 死亡からの経過: {time_since_death}
 
 【タスク生成の要件】
-1. **完全パーソナライズ**
-   - {relationship}として必要な手続き（配偶者→遺族年金、子→相続など）
-   - {prefecture}{municipality}の具体的な窓口情報を含める
-   - 死亡日から期限を正確に計算
+1. **パーソナライズ**
+   - {generalized_relationship}として必要な手続きを優先（例：配偶者→遺族年金、親→相続など）
+   - {region}地方の一般的な窓口情報を含める
+   - 経過期間に応じた期限を計算
 
 2. **Google検索で最新の公的情報を取得**
    - e-gov（電子政府総合窓口）で各手続きの法的根拠を検索
-   - {prefecture}{municipality}の公式サイトで窓口情報（部署名、電話番号、URL）を検索
+   - {region}地方の自治体の一般的な窓口情報（部署名、電話番号、URL）を検索
    - 法務省、厚労省、国税庁の最新情報を検索
 
 3. **Google検索でSNS・ブログから実用的なTipsを収集**
