@@ -42,10 +42,15 @@ from question_generator import (
     save_answer,
     check_all_questions_answered,
     get_user_answers,
-    format_question_for_line
+    format_question_for_line,
+    save_service_selection,
+    complete_service_selection,
+    is_service_selection_question,
+    get_user_selected_services,
 )
 from conversation_flow_manager import ConversationFlowManager, ConversationState
-from task_personalizer import generate_personalized_tasks
+from task_personalizer import generate_personalized_tasks, generate_service_specific_tasks
+from service_providers import get_provider_names_for_quick_reply, SERVICE_CATEGORIES
 from task_enhancer import enhance_tasks_with_tips, generate_general_tips_task
 from rate_limiter import is_rate_limited
 from subscription_manager import SubscriptionManager
@@ -920,9 +925,50 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
             questions = get_unanswered_questions(user_id, conn)
 
             if questions:
-                # 最初の未回答質問に対する回答として保存
                 first_question = questions[0]
-                save_answer(user_id, first_question['question_key'], message, conn)
+                question_type = first_question.get('question_type', 'yes_no')
+                question_key = first_question['question_key']
+
+                # 複数選択質問（サービス選択）の処理
+                if question_type == 'multiple_select':
+                    if message == '選択完了':
+                        # 選択完了 → 次の質問へ
+                        complete_service_selection(user_id, question_key, conn)
+                    else:
+                        # サービス名を保存（複数回選択可能）
+                        save_service_selection(user_id, question_key, message, conn)
+
+                        # 同じ質問の選択肢を再度表示（複数選択を継続）
+                        question_message = f"✅ {message} を追加しました。\n\n他にもあれば選択してください。なければ「選択完了」を押してください。"
+
+                        # 選択肢からQuick Replyを作成
+                        options = json.loads(first_question.get('options', '[]')) if first_question.get('options') else []
+                        if not options:
+                            # オプションがない場合はservice_typeから取得
+                            service_type_map = {
+                                'life_insurance_providers': 'life_insurance',
+                                'bank_providers': 'bank',
+                                'credit_card_providers': 'credit_card',
+                                'mobile_carrier_providers': 'mobile_carrier',
+                                'subscription_providers': 'subscription',
+                            }
+                            service_type = service_type_map.get(question_key)
+                            if service_type:
+                                options = get_provider_names_for_quick_reply(service_type, max_items=12)
+
+                        quick_reply_items = [
+                            QuickReplyItem(action=MessageAction(label=opt[:20], text=opt))
+                            for opt in options[:13]  # LINE Quick Replyは最大13個
+                        ]
+
+                        return {
+                            "type": "text_with_quick_reply",
+                            "text": question_message,
+                            "quick_reply": QuickReply(items=quick_reply_items)
+                        }
+                else:
+                    # 通常の質問（yes_no等）の回答を保存
+                    save_answer(user_id, question_key, message, conn)
 
                 # まだ未回答の質問があるか確認
                 remaining_questions = get_unanswered_questions(user_id, conn)
@@ -931,13 +977,35 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
                     # 次の質問を送信
                     next_question = remaining_questions[0]
                     question_message = format_question_for_line(next_question)
+                    next_question_type = next_question.get('question_type', 'yes_no')
 
-                    quick_reply = QuickReply(
-                        items=[
-                            QuickReplyItem(action=MessageAction(label="はい", text="はい")),
-                            QuickReplyItem(action=MessageAction(label="いいえ", text="いいえ"))
+                    # 質問タイプに応じたQuick Replyを作成
+                    if next_question_type == 'multiple_select':
+                        options = json.loads(next_question.get('options', '[]')) if next_question.get('options') else []
+                        if not options:
+                            service_type_map = {
+                                'life_insurance_providers': 'life_insurance',
+                                'bank_providers': 'bank',
+                                'credit_card_providers': 'credit_card',
+                                'mobile_carrier_providers': 'mobile_carrier',
+                                'subscription_providers': 'subscription',
+                            }
+                            service_type = service_type_map.get(next_question['question_key'])
+                            if service_type:
+                                options = get_provider_names_for_quick_reply(service_type, max_items=12)
+
+                        quick_reply_items = [
+                            QuickReplyItem(action=MessageAction(label=opt[:20], text=opt))
+                            for opt in options[:13]
                         ]
-                    )
+                        quick_reply = QuickReply(items=quick_reply_items)
+                    else:
+                        quick_reply = QuickReply(
+                            items=[
+                                QuickReplyItem(action=MessageAction(label="はい", text="はい")),
+                                QuickReplyItem(action=MessageAction(label="いいえ", text="いいえ"))
+                            ]
+                        )
 
                     return {
                         "type": "text_with_quick_reply",
@@ -952,7 +1020,21 @@ def process_profile_collection(user_id, line_user_id, message, relationship, pre
                     # Cloud Tasksに個別タスク生成ジョブを投入
                     enqueue_personalized_task_generation(user_id, line_user_id)
 
-                    return """✅ 質問へのご回答ありがとうございました！
+                    # 選択されたサービス数をカウント
+                    selected_services = get_user_selected_services(user_id, conn)
+                    service_count = sum(len(v) for v in selected_services.values())
+
+                    if service_count > 0:
+                        return f"""✅ 質問へのご回答ありがとうございました！
+
+📋 選択されたサービス: {service_count}件
+（保険会社・銀行等ごとに個別タスクを生成します）
+
+🤖 あなたの状況に特化した追加タスクを生成中です...
+
+⏱️ 完了したら通知でお知らせします。"""
+                    else:
+                        return """✅ 質問へのご回答ありがとうございました！
 
 🤖 あなたの状況に特化した追加タスクを生成中です...
 
@@ -2805,24 +2887,64 @@ def personalized_tasks_worker(request: Request):
 
         print(f"✅ Step 2完了: {len(personalized_tasks)}件の個別タスクを生成")
 
+        # Step 2.5: サービス固有タスク生成（保険会社・銀行等ごと）
+        service_specific_tasks = []
+        with engine.connect() as conn:
+            selected_services = get_user_selected_services(user_id, conn)
+
+            if selected_services:
+                print(f"🔍 選択されたサービス: {selected_services}")
+                service_specific_tasks = generate_service_specific_tasks(
+                    user_id, profile, selected_services, conn
+                )
+                print(f"✅ サービス固有タスク生成完了: {len(service_specific_tasks)}件")
+
+        total_tasks = len(personalized_tasks) + len(service_specific_tasks)
+
         # Step 2完了をマーク
         with engine.connect() as conn:
             flow_manager = ConversationFlowManager(conn)
             flow_manager.set_task_generation_step_status(
                 user_id, 'personalized', 'completed',
-                metadata={'task_count': len(personalized_tasks)}
+                metadata={
+                    'personalized_task_count': len(personalized_tasks),
+                    'service_specific_task_count': len(service_specific_tasks),
+                    'total_task_count': total_tasks
+                }
             )
 
-        # LINE通知
+        # LINE通知（サービス固有タスクの内訳を表示）
         configuration = get_configuration()
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
+
+            if service_specific_tasks:
+                # サービス別の内訳を作成
+                service_summary = {}
+                for task in service_specific_tasks:
+                    stype = task.get('service_type', 'その他')
+                    service_summary[stype] = service_summary.get(stype, 0) + 1
+
+                summary_text = "\n".join([
+                    f"・{SERVICE_CATEGORIES.get(k, {}).get('label', k)}: {v}件"
+                    for k, v in service_summary.items()
+                ])
+
+                notification_text = f"""✅ あなた専用のタスクを{total_tasks}件生成しました！
+
+【内訳】
+・基本の個別タスク: {len(personalized_tasks)}件
+・サービス固有タスク: {len(service_specific_tasks)}件
+{summary_text}
+
+「タスク」と送信して確認してください。"""
+            else:
+                notification_text = f"✅ あなた専用の追加タスクを{total_tasks}件生成しました！\n\n「タスク」と送信して確認してください。"
+
             line_bot_api.push_message(
                 PushMessageRequest(
                     to=line_user_id,
-                    messages=[TextMessage(
-                        text=f"✅ あなた専用の追加タスクを{len(personalized_tasks)}件生成しました！\n\n「タスク」と送信して確認してください。"
-                    )]
+                    messages=[TextMessage(text=notification_text)]
                 )
             )
 

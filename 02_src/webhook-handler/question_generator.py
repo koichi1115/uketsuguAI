@@ -3,11 +3,19 @@
 
 基本タスク生成後に、ユーザーの詳細な状況を把握するための
 追加質問を動的に生成する
+
+Enhanced: 具体的なサービス名（保険会社・銀行等）の複数選択機能を追加
 """
 import json
 from typing import List, Dict, Optional
 import sqlalchemy
 from datetime import datetime, timedelta
+
+from service_providers import (
+    FOLLOW_UP_SERVICE_QUESTIONS,
+    get_provider_names_for_quick_reply,
+    SERVICE_CATEGORIES,
+)
 
 
 class FollowUpQuestion:
@@ -83,10 +91,34 @@ def generate_follow_up_questions(
             display_order=5
         ),
         FollowUpQuestion(
+            question_text="銀行口座を持っていましたか？",
+            question_key="has_bank_account",
+            question_type="yes_no",
+            display_order=6
+        ),
+        FollowUpQuestion(
+            question_text="クレジットカードを持っていましたか？",
+            question_key="has_credit_card",
+            question_type="yes_no",
+            display_order=7
+        ),
+        FollowUpQuestion(
+            question_text="携帯電話の契約はありましたか？",
+            question_key="has_mobile_contract",
+            question_type="yes_no",
+            display_order=8
+        ),
+        FollowUpQuestion(
+            question_text="サブスクリプションサービス（Netflix、Amazon Prime等）の契約はありましたか？",
+            question_key="has_subscription",
+            question_type="yes_no",
+            display_order=9
+        ),
+        FollowUpQuestion(
             question_text="故人は自営業でしたか？",
             question_key="is_self_employed",
             question_type="yes_no",
-            display_order=6
+            display_order=10
         ),
     ]
 
@@ -99,7 +131,7 @@ def generate_follow_up_questions(
                 question_text="ご家族に扶養されていた方（お子様など）はいらっしゃいますか？",
                 question_key="is_dependent_family",
                 question_type="yes_no",
-                display_order=7
+                display_order=11
             )
         )
         questions.append(
@@ -107,7 +139,7 @@ def generate_follow_up_questions(
                 question_text="お子様はいらっしゃいますか？",
                 question_key="has_children",
                 question_type="yes_no",
-                display_order=8
+                display_order=12
             )
         )
 
@@ -226,11 +258,13 @@ def save_answer(user_id: str, question_key: str, answer: str, conn):
     )
 
     # user_profilesテーブルも更新（該当するカラムがある場合）
-    if question_key in [
+    profile_columns = [
         'has_pension', 'has_care_insurance', 'has_real_estate',
         'has_vehicle', 'has_life_insurance', 'is_self_employed',
-        'is_dependent_family', 'has_children'
-    ]:
+        'is_dependent_family', 'has_children',
+        'has_bank_account', 'has_credit_card', 'has_mobile_contract', 'has_subscription'
+    ]
+    if question_key in profile_columns:
         boolean_answer = answer.lower() in ['はい', 'yes', 'true', '1']
         conn.execute(
             sqlalchemy.text(f"""
@@ -240,6 +274,10 @@ def save_answer(user_id: str, question_key: str, answer: str, conn):
             """),
             {'answer': boolean_answer, 'user_id': user_id}
         )
+
+        # はいの場合、連動質問（サービス詳細選択）を生成
+        if boolean_answer and question_key in FOLLOW_UP_SERVICE_QUESTIONS:
+            _create_service_selection_question(user_id, question_key, conn)
 
     conn.commit()
 
@@ -318,5 +356,231 @@ def format_question_for_line(question: Dict) -> str:
         text += "\n\n以下から選択してください：\n"
         for i, option in enumerate(question['options'], 1):
             text += f"{i}. {option}\n"
+    elif question['question_type'] == 'multiple_select':
+        text += "\n\n複数選択可能です。選び終わったら「選択完了」を押してください。"
 
     return text
+
+
+def _create_service_selection_question(user_id: str, parent_question_key: str, conn):
+    """
+    サービス詳細選択の連動質問を作成
+
+    Args:
+        user_id: ユーザーID
+        parent_question_key: 親質問のキー（has_life_insurance等）
+        conn: データベース接続
+    """
+    follow_up_config = FOLLOW_UP_SERVICE_QUESTIONS.get(parent_question_key)
+    if not follow_up_config:
+        return
+
+    question_key = follow_up_config["question_key"]
+    service_type = follow_up_config["service_type"]
+
+    # 既に存在するか確認
+    existing = conn.execute(
+        sqlalchemy.text(
+            """
+            SELECT id FROM follow_up_questions
+            WHERE user_id = :user_id AND question_key = :question_key
+            """
+        ),
+        {'user_id': user_id, 'question_key': question_key}
+    ).fetchone()
+
+    if existing:
+        return
+
+    # 親質問のdisplay_orderを取得して、その直後に挿入
+    parent_order = conn.execute(
+        sqlalchemy.text(
+            """
+            SELECT display_order FROM follow_up_questions
+            WHERE user_id = :user_id AND question_key = :parent_key
+            """
+        ),
+        {'user_id': user_id, 'parent_key': parent_question_key}
+    ).fetchone()
+
+    new_order = (parent_order[0] if parent_order else 0) + 0.5
+
+    # 選択肢を取得
+    options = get_provider_names_for_quick_reply(service_type, max_items=12)
+
+    conn.execute(
+        sqlalchemy.text(
+            """
+            INSERT INTO follow_up_questions (
+                user_id, question_text, question_type, question_key,
+                options, display_order, parent_question_key, trigger_answer
+            )
+            VALUES (
+                :user_id, :question_text, :question_type, :question_key,
+                :options, :display_order, :parent_key, :trigger_answer
+            )
+            """
+        ),
+        {
+            'user_id': user_id,
+            'question_text': follow_up_config["question_text"],
+            'question_type': 'multiple_select',
+            'question_key': question_key,
+            'options': json.dumps(options, ensure_ascii=False),
+            'display_order': new_order,
+            'parent_key': parent_question_key,
+            'trigger_answer': 'はい'
+        }
+    )
+
+
+def save_service_selection(user_id: str, question_key: str, service_name: str, conn):
+    """
+    ユーザーが選択したサービス（保険会社・銀行等）を保存
+
+    Args:
+        user_id: ユーザーID
+        question_key: 質問キー（life_insurance_providers等）
+        service_name: 選択されたサービス名
+        conn: データベース接続
+    """
+    # question_keyからservice_typeを特定
+    service_type_map = {
+        'life_insurance_providers': 'life_insurance',
+        'bank_providers': 'bank',
+        'credit_card_providers': 'credit_card',
+        'mobile_carrier_providers': 'mobile_carrier',
+        'subscription_providers': 'subscription',
+    }
+
+    service_type = service_type_map.get(question_key)
+    if not service_type:
+        return
+
+    # 「選択完了」「該当なし」は保存しない
+    if service_name in ['選択完了', '該当なし']:
+        return
+
+    # 既に同じサービスが登録されているか確認
+    existing = conn.execute(
+        sqlalchemy.text(
+            """
+            SELECT id FROM user_services
+            WHERE user_id = :user_id AND service_type = :service_type AND service_name = :service_name
+            """
+        ),
+        {'user_id': user_id, 'service_type': service_type, 'service_name': service_name}
+    ).fetchone()
+
+    if existing:
+        return
+
+    # 「その他」の場合はcustom_nameフラグを設定
+    is_custom = service_name == 'その他'
+
+    conn.execute(
+        sqlalchemy.text(
+            """
+            INSERT INTO user_services (user_id, service_type, service_name, custom_name)
+            VALUES (:user_id, :service_type, :service_name, :custom_name)
+            """
+        ),
+        {
+            'user_id': user_id,
+            'service_type': service_type,
+            'service_name': service_name,
+            'custom_name': None  # 後で「その他」の詳細入力時に更新
+        }
+    )
+    conn.commit()
+
+
+def complete_service_selection(user_id: str, question_key: str, conn):
+    """
+    サービス選択を完了としてマーク
+
+    Args:
+        user_id: ユーザーID
+        question_key: 質問キー
+        conn: データベース接続
+    """
+    # 選択されたサービスを取得してanswer欄に保存
+    service_type_map = {
+        'life_insurance_providers': 'life_insurance',
+        'bank_providers': 'bank',
+        'credit_card_providers': 'credit_card',
+        'mobile_carrier_providers': 'mobile_carrier',
+        'subscription_providers': 'subscription',
+    }
+    service_type = service_type_map.get(question_key)
+
+    if service_type:
+        services = conn.execute(
+            sqlalchemy.text(
+                """
+                SELECT service_name FROM user_services
+                WHERE user_id = :user_id AND service_type = :service_type
+                """
+            ),
+            {'user_id': user_id, 'service_type': service_type}
+        ).fetchall()
+
+        answer = ', '.join([s[0] for s in services]) if services else '該当なし'
+    else:
+        answer = '選択完了'
+
+    conn.execute(
+        sqlalchemy.text(
+            """
+            UPDATE follow_up_questions
+            SET answer = :answer, is_answered = true, answered_at = :answered_at
+            WHERE user_id = :user_id AND question_key = :question_key
+            """
+        ),
+        {
+            'answer': answer,
+            'answered_at': datetime.now(),
+            'user_id': user_id,
+            'question_key': question_key
+        }
+    )
+    conn.commit()
+
+
+def get_user_selected_services(user_id: str, conn) -> Dict[str, List[str]]:
+    """
+    ユーザーが選択したサービスを取得
+
+    Args:
+        user_id: ユーザーID
+        conn: データベース接続
+
+    Returns:
+        {service_type: [service_name, ...]} の辞書
+    """
+    result = conn.execute(
+        sqlalchemy.text(
+            """
+            SELECT service_type, service_name, custom_name
+            FROM user_services
+            WHERE user_id = :user_id
+            ORDER BY service_type, created_at
+            """
+        ),
+        {'user_id': user_id}
+    )
+
+    services = {}
+    for row in result:
+        service_type = row[0]
+        service_name = row[2] if row[2] else row[1]  # custom_nameがあればそちらを使用
+        if service_type not in services:
+            services[service_type] = []
+        services[service_type].append(service_name)
+
+    return services
+
+
+def is_service_selection_question(question_key: str) -> bool:
+    """質問がサービス選択質問かどうかを判定"""
+    return question_key.endswith('_providers')
